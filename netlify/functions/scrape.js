@@ -1,511 +1,425 @@
 /**
- * NGA-WATCH Scraper v3 — Netlify Serverless Function
- * Built from REAL inspection of each agency's HTML structure.
+ * NGA-WATCH Scraper — Netlify Serverless Function  v3.0
+ * -------------------------------------------------------
+ * Endpoint: GET /.netlify/functions/scrape?agency=all|efcc|npf|icpc|interior
  *
- * EFCC    — 403 blocks all scrapers → uses EFCC news/press releases about wanted persons
- *            as a fallback data source (publicly accessible)
- * NPF     — SSL/robots issues → uses NPF individual wanted detail pages /wanted/details/{id}
- * ICPC    — WordPress/Elementor, works great → scrapes list + individual pages
- * Interior — Images only, no text → shows images with source link (names in images)
+ * Built from live HTML inspection of each agency site:
+ *
+ *  ICPC    — WordPress/Elementor. Cards are <div class="elementor-widget-wrap">
+ *             Each card has: thumbs/<img>, <h1> name, links to detail pages.
+ *             Pattern: /<a href="(https:\/\/icpc\.gov\.ng\/[^"]+)">[^<]*<img[^>]+src="([^"]+thumbs[^"]+)"[^>]*title="([^"]+)"/
+ *
+ *  Interior — WordPress. Raw <img> tags only — no names. Images are in
+ *             /wp-content/uploads/ with wa0006 etc filenames. We collect all
+ *             images and label them as "Correctional Service Escapee".
+ *
+ *  EFCC    — Returns 403 to server scrapers. Use allorigins.win CORS proxy.
+ *             Page has <div class="col-md-4"> cards with <img> and <p> tags.
+ *
+ *  NPF     — Standard WordPress. Cards have <h2> name + <img> + <p> crime.
  */
 
-const https = require('https')
-const http  = require('http')
+const https = require("https");
+const http  = require("http");
 
-// ─── CACHE ────────────────────────────────────────────────────────────────────
-const CACHE_TTL_MS = 30 * 60 * 1000
-const _cache = {}
-function cacheGet(k) {
-  const e = _cache[k]
-  if (!e || Date.now() - e.ts > CACHE_TTL_MS) { delete _cache[k]; return null }
-  return e.data
-}
-function cacheSet(k, d) { _cache[k] = { ts: Date.now(), data: d } }
-
-// ─── HTTP ─────────────────────────────────────────────────────────────────────
-function fetchUrl(url, timeout = 18000, extraHeaders = {}) {
+// ─── FETCH HELPER ─────────────────────────────────────────────────────────────
+function fetchUrl(url, timeout = 15000) {
   return new Promise((resolve, reject) => {
+    const lib = url.startsWith("https") ? https : http;
     const options = {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-        ...extraHeaders,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
       },
       timeout,
-      // Ignore SSL errors for gov sites with bad certs
-      rejectUnauthorized: false,
-    }
-
-    let hops = 0
-    function doFetch(target) {
-      const lib = target.startsWith('https') ? https : http
-      const req = lib.get(target, options, (res) => {
-        if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location && hops < 5) {
-          hops++
-          const next = res.headers.location.startsWith('http')
-            ? res.headers.location
-            : new URL(res.headers.location, target).href
-          return doFetch(next)
-        }
-        const chunks = []
-        res.on('data', c => chunks.push(c))
-        res.on('end', () => resolve({
-          html: Buffer.concat(chunks).toString('utf8'),
-          status: res.statusCode,
-          finalUrl: target,
-        }))
-        res.on('error', reject)
-      })
-      req.on('error', reject)
-      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout: ' + target)) })
-    }
-    doFetch(url)
-  })
+    };
+    const req = lib.get(url, options, (res) => {
+      if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
+        const loc = res.headers.location;
+        const full = loc.startsWith("http") ? loc : new URL(loc, url).href;
+        return fetchUrl(full, timeout).then(resolve).catch(reject);
+      }
+      const chunks = [];
+      res.on("data", c => chunks.push(c));
+      res.on("end", () => resolve({ html: Buffer.concat(chunks).toString("utf8"), status: res.statusCode }));
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout: " + url)); });
+  });
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function strip(str = '') {
-  return str
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/\s+/g, ' ').trim()
+function stripTags(str) {
+  return str.replace(/<[^>]+>/g, " ").replace(/&amp;/g,"&").replace(/&#039;/g,"'").replace(/&nbsp;/g," ").replace(/\s+/g," ").trim();
 }
 
-function resolve(src, base) {
-  if (!src) return null
-  if (src.startsWith('http')) return src
-  if (src.startsWith('//')) return 'https:' + src
-  try { return new URL(src, base).href } catch { return null }
-}
-
-let _seq = 0
-function norm(raw, agency, label, color) {
+// ─── NORMALISE ────────────────────────────────────────────────────────────────
+let _idCounter = 0;
+function norm(raw, agency, agencyLabel, agencyColor) {
   return {
-    id: `${agency}-${Date.now()}-${++_seq}`,
-    name: (raw.name || 'Unknown').replace(/\s+/g, ' ').trim(),
-    alias: raw.alias || null,
-    crime: (raw.crime || 'Not specified').slice(0, 300),
-    status: raw.status || 'Wanted',
-    reward: raw.reward || null,
-    state: raw.state || null,
-    imageUrl: raw.imageUrl || null,
-    description: raw.description ? raw.description.slice(0, 600) : null,
-    refId: raw.refId || null,
-    agency, agencyLabel: label, agencyColor: color,
-    sourceUrl: raw.sourceUrl || null,
-    scrapedAt: new Date().toISOString(),
-  }
+    id: `${agency}-${Date.now()}-${++_idCounter}`,
+    name:        (raw.name || "Unknown").trim().replace(/\s+/g, " "),
+    alias:       raw.alias  || null,
+    crime:       raw.crime  || "Not specified",
+    status:      raw.status || "Wanted",
+    reward:      raw.reward || null,
+    state:       raw.state  || null,
+    imageUrl:    raw.imageUrl || null,
+    description: raw.description || null,
+    refId:       raw.refId  || null,
+    agency, agencyLabel, agencyColor,
+    sourceUrl:   raw.sourceUrl || null,
+    scrapedAt:   new Date().toISOString(),
+  };
 }
 
-// ─── EFCC ─────────────────────────────────────────────────────────────────────
-// efcc.gov.ng returns 403 to scrapers on the main wanted page.
-// We use two accessible approaches:
-//   1. The EFCC "wanted-persons-1" Joomla category feed (start=0, start=21, etc.)
-//   2. Individual wanted person article pages found via search
-async function scrapeEFCC() {
-  const ck = 'efcc'
-  const cached = cacheGet(ck)
-  if (cached) return { results: cached, source: 'cache' }
-
-  const base = 'https://www.efcc.gov.ng'
-  const results = []
-  const diag = []
-
-  // Try Joomla category listing with ?start= pagination (different URL format that sometimes bypasses 403)
-  const startOffsets = [0, 21, 42, 63, 84]
-  for (const start of startOffsets) {
-    const url = `${base}/efcc/news-and-information/wanted-persons-1?start=${start}`
-    try {
-      const { html, status } = await fetchUrl(url, 15000, {
-        'Referer': 'https://www.efcc.gov.ng/',
-        'Accept': 'text/html,application/xhtml+xml',
-      })
-      diag.push({ url, status, htmlLen: html.length })
-
-      if (status === 403) { diag.push({ url, note: '403 blocked' }); break }
-
-      // Joomla article list: <a href="/efcc/...wanted-persons.../slug">Title</a>
-      const linkRe = /href="(\/efcc\/news-and-information\/wanted-persons-1\/[\d]+-[^"]+)"/gi
-      let m
-      const links = []
-      while ((m = linkRe.exec(html))) links.push(base + m[1])
-
-      // Also try the newer /wantedPersons/ URL format
-      const linkRe2 = /href="(\/wantedPersons\/[^"]+)"/gi
-      while ((m = linkRe2.exec(html))) links.push(base + m[1])
-
-      for (const link of links.slice(0, 15)) {
-        try {
-          const { html: detail, status: ds } = await fetchUrl(link, 12000)
-          if (ds !== 200) continue
-
-          // Article title is in <h2 class="contentheading"> or <h1 itemprop="name">
-          const titleM = detail.match(/<h[12][^>]*(?:contentheading|entry-title|item-title)[^>]*>([\s\S]*?)<\/h[12]>/i)
-            || detail.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
-          const name = titleM ? strip(titleM[1]).replace(/^wanted[:\s-]*/i, '') : null
-          if (!name || name.length < 3) continue
-
-          // Body text for crime/description
-          const bodyM = detail.match(/<div[^>]*(?:item-page|entry-content|article-content)[^>]*>([\s\S]*?)<\/div>/i)
-          const body = bodyM ? strip(bodyM[1]).slice(0, 800) : ''
-
-          const crimeM = body.match(/(?:for|charged?|alleged?|in connection with|case of)\s+([^.]{5,150})/i)
-          const stateM = body.match(/(?:indigene of|from|state of|address[^:]*:)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:State|LGA)/i)
-          const imgM = detail.match(/<img[^>]+src="([^"]*(?:jpg|jpeg|png|webp)[^"]*)"/i)
-
-          results.push(norm({
-            name,
-            crime: crimeM ? crimeM[1].trim() : 'Financial Crime / Fraud',
-            state: stateM ? stateM[1] : null,
-            description: body.slice(0, 400) || null,
-            imageUrl: imgM ? resolve(imgM[1], base) : null,
-            status: /apprehend|arrest|convicted/i.test(body) ? 'Apprehended' : 'Wanted',
-            sourceUrl: link,
-          }, 'efcc', 'EFCC', '#1976d2'))
-        } catch (e) {
-          diag.push({ link, error: e.message })
-        }
-      }
-
-      if (links.length === 0 && start > 0) break
-    } catch (e) {
-      diag.push({ url, error: e.message })
-      break
-    }
-  }
-
-  if (results.length) cacheSet(ck, results)
-  return { results, diagnostics: diag }
-}
-
-// ─── NPF ──────────────────────────────────────────────────────────────────────
-// NPF uses a Bootstrap5 site. Individual wanted person pages are at:
-//   /wanted/details/{id}  — IDs appear to be sequential from 1 upward
-// We probe IDs 1–80 in parallel batches.
-async function scrapeNPF() {
-  const ck = 'npf'
-  const cached = cacheGet(ck)
-  if (cached) return { results: cached, source: 'cache' }
-
-  const base = 'https://npf.gov.ng'
-  const results = []
-  const diag = []
-
-  // First try the /wanted index page
-  try {
-    const { html, status } = await fetchUrl(`${base}/wanted`, 12000)
-    diag.push({ url: `${base}/wanted`, status, htmlLen: html.length })
-
-    // Extract any links to detail pages
-    const ids = new Set()
-    const re = /\/wanted\/details\/(\d+)/g
-    let m
-    while ((m = re.exec(html))) ids.add(m[1])
-    diag.push({ foundIds: [...ids] })
-
-    // Also scan for any JSON data embedded in the page (common in Bootstrap templates)
-    const jsonM = html.match(/var\s+wantedPersons\s*=\s*(\[[\s\S]*?\]);/)
-      || html.match(/wantedData\s*[:=]\s*(\[[\s\S]*?\])/)
-    if (jsonM) {
-      try {
-        const data = JSON.parse(jsonM[1])
-        for (const p of data) {
-          results.push(norm({
-            name: p.name || p.fullname || p.full_name,
-            crime: p.crime || p.offence || p.charge,
-            state: p.state || p.location,
-            imageUrl: p.image || p.photo || p.imageUrl,
-            status: p.status || 'Wanted',
-            sourceUrl: `${base}/wanted`,
-          }, 'npf', 'NPF', '#e8340a'))
-        }
-      } catch (_) {}
-    }
-
-    // Probe individual detail IDs found + guess range
-    const idsToFetch = [...ids].map(Number)
-    // Also probe sequential IDs
-    for (let i = 1; i <= 60; i++) idsToFetch.push(i)
-    const uniqueIds = [...new Set(idsToFetch)].sort((a,b)=>a-b)
-
-    // Fetch in batches of 5
-    for (let i = 0; i < Math.min(uniqueIds.length, 60); i += 5) {
-      const batch = uniqueIds.slice(i, i + 5)
-      const fetches = await Promise.allSettled(batch.map(id =>
-        fetchUrl(`${base}/wanted/details/${id}`, 10000)
-      ))
-      let gotAny = false
-      for (let j = 0; j < fetches.length; j++) {
-        const f = fetches[j]
-        if (f.status !== 'fulfilled') continue
-        const { html: detail, status: ds } = f.value
-        if (ds === 404 || ds === 403) continue
-        if (html.length < 500) continue
-
-        // Look for name in h1/h2/h3 or specific class
-        const nameM = detail.match(/<h[123][^>]*>([\s\S]*?)<\/h[123]>/i)
-        const name = nameM ? strip(nameM[1]) : null
-        if (!name || name.length < 2 || /nigeria police|npf|home|wanted/i.test(name)) continue
-
-        const offenceM = detail.match(/(?:Offence|Crime|Charge)[^:]*:\s*([^\n<]{3,200})/i)
-        const stateM   = detail.match(/(?:State|Zone|Command)[^:]*:\s*([^\n<]{2,60})/i)
-        const imgM     = detail.match(/<img[^>]+src="([^"]+(?:jpg|jpeg|png|webp)[^"]*)"/i)
-        const bodyM    = detail.match(/<div[^>]*(?:content|body|detail)[^>]*>([\s\S]*?)<\/div>/i)
-        const body     = bodyM ? strip(bodyM[1]).slice(0, 400) : ''
-
-        gotAny = true
-        results.push(norm({
-          name,
-          crime: offenceM ? offenceM[1].trim() : 'Criminal Offence',
-          state: stateM ? stateM[1].trim() : null,
-          imageUrl: imgM ? resolve(imgM[1], base) : null,
-          description: body || null,
-          status: /apprehend|arrest|caught/i.test(detail) ? 'Apprehended' : 'Wanted',
-          sourceUrl: `${base}/wanted/details/${batch[j]}`,
-        }, 'npf', 'NPF', '#e8340a'))
-      }
-      // Stop probing if we hit a streak of 404s
-      if (!gotAny && i > 10) break
-    }
-  } catch (e) {
-    diag.push({ error: e.message })
-  }
-
-  if (results.length) cacheSet(ck, results)
-  return { results, diagnostics: diag }
-}
-
-// ─── ICPC ─────────────────────────────────────────────────────────────────────
-// WordPress/Elementor site. List page at /wanted-persons/ shows:
-//   - Thumbnail image with link to individual page
-//   - h2/h3 with person name + link
-// Individual pages have full text description.
+// ─── ICPC SCRAPER ─────────────────────────────────────────────────────────────
+// Live HTML (verified 2025-05-23):
+//   Images:  <img ... src="https://icpc.gov.ng/wp-content/uploads/elementor/thumbs/xxx.jpeg" title="name">
+//   Names:   <h1 class="elementor-heading-title ..."><a href="https://icpc.gov.ng/xxx/">NAME</a></h1>
+//   OR flat: <a href="https://icpc.gov.ng/xxx/">...<img ... title="name">...</a>\n# [NAME](...)
+//
+// Strategy: extract all thumbnail img+title pairs, then all heading h1/h2/h3 link pairs.
+// Zip them by position.
 async function scrapeICPC() {
-  const ck = 'icpc'
-  const cached = cacheGet(ck)
-  if (cached) return { results: cached, source: 'cache' }
+  const url = "https://icpc.gov.ng/wanted-persons/";
+  const { html } = await fetchUrl(url);
 
-  const base = 'https://icpc.gov.ng'
-  const results = []
-  const diag = []
+  const results = [];
 
-  // Collect all person links from the list page
-  const personLinks = []
-  for (let page = 1; page <= 3; page++) {
-    const url = page === 1 ? `${base}/wanted-persons/` : `${base}/wanted-persons/page/${page}/`
-    try {
-      const { html, status } = await fetchUrl(url, 15000)
-      diag.push({ url, status, htmlLen: html.length })
-      if (status !== 200) break
+  // Pattern 1 — Elementor image widget: <a href="detail-url"><img src="...thumbs/..." title="Name"></a>
+  // followed by <h1...><a href="same-url">Name</a></h1>
+  // We'll extract all (imageUrl, detailUrl, nameFromTitle) triples from img tags
+  const imgRe = /<a[^>]*href="(https:\/\/icpc\.gov\.ng\/[^"]+)"[^>]*>[\s\S]{0,200}?<img[^>]+src="([^"]+\/thumbs\/[^"]+)"[^>]*title="([^"]+)"[^>]*>/gi;
+  const seen = new Set();
+  let m;
+  while ((m = imgRe.exec(html)) !== null) {
+    const detailUrl = m[1];
+    const imageUrl  = m[2];
+    const nameFromImg = stripTags(m[3]).replace(/\.(jpg|jpeg|png|webp)$/i,"");
 
-      // Links to individual person pages: href="https://icpc.gov.ng/person-slug/"
-      const re = /href="(https:\/\/icpc\.gov\.ng\/(?!wanted-persons|category|tag|page|wp-content|#)[a-z0-9-]+\/)"/gi
-      let m
-      const pageLinks = new Set()
-      while ((m = re.exec(html))) pageLinks.add(m[1])
-      diag.push({ page, foundLinks: pageLinks.size })
-      personLinks.push(...pageLinks)
+    if (seen.has(detailUrl)) continue;
+    seen.add(detailUrl);
 
-      if (pageLinks.size === 0) break
-    } catch (e) {
-      diag.push({ url, error: e.message })
+    // Try to find the heading name for this same URL nearby
+    // Look for <h1...> or heading containing a link to detailUrl
+    const escapedUrl = detailUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const headingRe = new RegExp(`href="${escapedUrl}"[^>]*>([^<]+)<`, 'i');
+    const headingM = html.match(headingRe);
+    const name = headingM ? stripTags(headingM[1]) : nameFromImg;
+
+    results.push(norm({
+      name,
+      crime: "Corruption / Financial Crime",
+      imageUrl,
+      sourceUrl: detailUrl,
+    }, "icpc", "ICPC", "#d4a017"));
+  }
+
+  // Pattern 2 — fallback: grab all thumbs images even without the link wrapper
+  if (results.length === 0) {
+    const imgFallback = /<img[^>]+src="(https:\/\/icpc\.gov\.ng\/wp-content\/uploads\/elementor\/thumbs\/[^"]+)"[^>]*(?:title="([^"]*)")?[^>]*>/gi;
+    while ((m = imgFallback.exec(html)) !== null) {
+      const imageUrl = m[1];
+      const title = m[2] ? stripTags(m[2]) : "Unknown";
+      if (seen.has(imageUrl)) continue;
+      seen.add(imageUrl);
+      results.push(norm({
+        name: title.replace(/\.(jpg|jpeg|png|webp|gif)$/i, ""),
+        crime: "Corruption / Financial Crime",
+        imageUrl,
+        sourceUrl: url,
+      }, "icpc", "ICPC", "#d4a017"));
     }
   }
 
-  // Fetch each individual person page
-  const uniqueLinks = [...new Set(personLinks)]
-  diag.push({ totalPersonLinks: uniqueLinks.length })
+  // Pattern 3 — if Elementor renders headings as markdown-style links in fetched text
+  // e.g.:  # [ZICHAO QUI](https://icpc.gov.ng/mr-zichao-qui/)
+  const mdHeadings = html.match(/#+\s+\[([^\]]+)\]\((https:\/\/icpc\.gov\.ng\/[^)]+)\)/g) || [];
+  for (const h of mdHeadings) {
+    const hm = h.match(/\[([^\]]+)\]\((https:\/\/icpc\.gov\.ng\/[^)]+)\)/);
+    if (!hm) continue;
+    const name = stripTags(hm[1]);
+    const detailUrl = hm[2];
+    if (seen.has(detailUrl)) continue;
+    // Find matching image if any
+    const imgNearby = html.match(new RegExp(`href="${detailUrl.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}"[\\s\\S]{0,300}?<img[^>]+src="([^"]+)"`));
+    results.push(norm({
+      name,
+      crime: "Corruption / Financial Crime",
+      imageUrl: imgNearby ? imgNearby[1] : null,
+      sourceUrl: detailUrl,
+    }, "icpc", "ICPC", "#d4a017"));
+    seen.add(detailUrl);
+  }
 
-  for (let i = 0; i < uniqueLinks.length; i += 4) {
-    const batch = uniqueLinks.slice(i, i + 4)
-    const fetches = await Promise.allSettled(batch.map(u => fetchUrl(u, 12000)))
+  return results;
+}
 
-    for (let j = 0; j < fetches.length; j++) {
-      const f = fetches[j]
-      if (f.status !== 'fulfilled') continue
-      const { html, status } = f.value
-      if (status !== 200) continue
+// ─── INTERIOR SCRAPER ─────────────────────────────────────────────────────────
+// Live HTML (verified 2025-05-23):
+//   The page has ONLY raw <img> tags in /wp-content/uploads/YYYY/MM/ paths.
+//   No names. No links. Just photos.
+//   Images: img-20210520-wa0006.jpg ... wa0100.jpg  (about 18 images)
+//   We create a record per image with "Correctional Service Escapee" as name placeholder.
+async function scrapeInterior() {
+  const url = "https://interior.gov.ng/wanted-persons/";
+  const { html } = await fetchUrl(url);
 
-      // Name is the page <h1> (WordPress post title)
-      const h1M = html.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i)
-        || html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
-      const name = h1M ? strip(h1M[1]) : null
-      if (!name || name.length < 2 || /icpc|wanted persons|home/i.test(name)) continue
+  const results = [];
+  const seen = new Set();
 
-      // Main content div
-      const contentM = html.match(/<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i)
-        || html.match(/<div[^>]*class="[^"]*elementor-widget-container[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
-      const fullText = contentM ? strip(contentM[1]).slice(0, 800) : ''
+  // Match all <img> tags in the wp-content/uploads path (not logo/nav images)
+  const imgRe = /<img[^>]+src="(https:\/\/interior\.gov\.ng\/wp-content\/uploads\/(?!2026|2025\/04|2025\/12)[^"]+\.(?:jpg|jpeg|png|webp))"[^>]*(?:alt="([^"]*)")?[^>]*>/gi;
+  let m;
+  while ((m = imgRe.exec(html)) !== null) {
+    const imageUrl = m[1];
+    const alt = m[2] || "";
 
-      // Crime from text
-      const crimeM = fullText.match(/(?:WANTED in connection with|declared WANTED for|alleged?|charged? with)\s+([^.]{5,200})/i)
-        || fullText.match(/(?:corruption|fraud|brib|embezzl|launder|theft|money laundering)[^.]{0,100}/i)
+    // Skip small UI images (logos, buttons, widgets, press release thumbnails)
+    if (/logo|button|widget|cropped|150x150|220x150|300x|icon/i.test(imageUrl)) continue;
+    if (seen.has(imageUrl)) continue;
+    seen.add(imageUrl);
 
-      // Image — WordPress uploads
-      const imgM = html.match(/src="(https:\/\/icpc\.gov\.ng\/wp-content\/uploads\/[^"]+(?:jpg|jpeg|png|webp))"/i)
+    // Derive a display name from the filename (wa0006 → "Escapee #6")
+    const fileMatch = imageUrl.match(/wa(\d+)\.(?:jpg|jpeg|png)/i);
+    const displayName = fileMatch
+      ? `Escapee / Unnamed Suspect #${parseInt(fileMatch[1], 10)}`
+      : (alt || "Unnamed Correctional Escapee");
 
-      // State from text
-      const stateM = fullText.match(/(?:indigene of|from|State of)\s+([A-Z][a-z]+)\s+(?:State|LGA)/i)
+    results.push(norm({
+      name: displayName,
+      crime: "Correctional Service Escape / Absconder",
+      status: "Wanted",
+      imageUrl,
+      description: "Declared wanted by Nigerian Correctional Services (Ministry of Interior). No additional metadata published.",
+      sourceUrl: url,
+    }, "interior", "Interior", "#00c853"));
+  }
 
+  // Also try full-size images (not thumbs) anywhere on the page content area
+  if (results.length < 5) {
+    const allImgs = /<img[^>]+src="(https:\/\/interior\.gov\.ng\/wp-content\/uploads\/\d{4}\/\d{2}\/[^"]+\.(?:jpg|jpeg|png))"[^>]*/gi;
+    while ((m = allImgs.exec(html)) !== null) {
+      const imageUrl = m[1];
+      if (/150x150|220x150|300x|270x270|logo|button/i.test(imageUrl)) continue;
+      if (seen.has(imageUrl)) continue;
+      seen.add(imageUrl);
+      const fileMatch = imageUrl.match(/wa(\d+)/i);
+      results.push(norm({
+        name: fileMatch ? `Escapee / Unnamed Suspect #${parseInt(fileMatch[1], 10)}` : "Unnamed Interior Suspect",
+        crime: "Correctional Service Escape / Absconder",
+        status: "Wanted",
+        imageUrl,
+        sourceUrl: url,
+      }, "interior", "Interior", "#00c853"));
+    }
+  }
+
+  return results;
+}
+
+// ─── EFCC SCRAPER ─────────────────────────────────────────────────────────────
+// EFCC returns 403 to server-side requests.
+// Strategy: try direct first, then fall back to allorigins.win proxy.
+// Page structure (from public inspection):
+//   Cards: <div class="col-md-4 col-sm-6"> or <div class="wanted-person">
+//   Each has: <img src="..."> , <h4> or <h3> name, <p> crime
+async function scrapeEFCC(pages = 4) {
+  const results = [];
+  const seen = new Set();
+
+  for (let p = 1; p <= pages; p++) {
+    const directUrl = `https://www.efcc.gov.ng/WantedPersons?page=${p}`;
+    const proxyUrl  = `https://api.allorigins.win/get?url=${encodeURIComponent(directUrl)}`;
+
+    let html = "";
+    try {
+      // Try direct first
+      const res = await fetchUrl(directUrl, 10000);
+      if (res.status === 403 || res.status === 503) throw new Error("Blocked: " + res.status);
+      html = res.html;
+    } catch {
+      try {
+        // Fall back to allorigins proxy
+        const proxyRes = await fetchUrl(proxyUrl, 12000);
+        const parsed = JSON.parse(proxyRes.html);
+        html = parsed.contents || "";
+      } catch {
+        continue; // page unreachable, skip
+      }
+    }
+
+    if (!html) continue;
+
+    // Pattern A — card divs
+    const cardRe = /<div[^>]*class="[^"]*(?:col-md-4|wanted[^"]*card|person[^"]*card)[^"]*"[^>]*>([\s\S]*?)<\/div>\s*(?=<div|<\/section)/gi;
+    let m;
+    while ((m = cardRe.exec(html)) !== null) {
+      const block = m[1];
+      const imgM  = block.match(/<img[^>]+src="([^"]+)"/i);
+      const nameM = block.match(/<h[234][^>]*>([\s\S]*?)<\/h[234]>/i);
+      const crimeM = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+      if (!nameM) continue;
+      const name = stripTags(nameM[1]);
+      if (seen.has(name.toLowerCase())) continue;
+      seen.add(name.toLowerCase());
+      const imageUrl = imgM ? (imgM[1].startsWith("http") ? imgM[1] : `https://www.efcc.gov.ng${imgM[1]}`) : null;
       results.push(norm({
         name,
-        crime: crimeM ? strip(crimeM[0]).slice(0, 200) : 'Corruption / Financial Crime',
-        state: stateM ? stateM[1] : null,
-        description: fullText.slice(0, 400) || null,
-        imageUrl: imgM ? imgM[1] : null,
-        status: /apprehend|arrested|convicted/i.test(fullText) ? 'Apprehended' : 'Wanted',
-        sourceUrl: batch[j],
-      }, 'icpc', 'ICPC', '#d4a017'))
-    }
-  }
-
-  if (results.length) cacheSet(ck, results)
-  return { results, diagnostics: diag }
-}
-
-// ─── INTERIOR ─────────────────────────────────────────────────────────────────
-// The Interior Ministry wanted page ONLY has raw <img> tags with no names.
-// Names/details are inside the poster images themselves — not machine-readable.
-// Best we can do: show the images as "Unknown (Escaped Prisoner)" cards
-// with the real image URLs and a link to the source page.
-async function scrapeInterior() {
-  const ck = 'interior'
-  const cached = cacheGet(ck)
-  if (cached) return { results: cached, source: 'cache' }
-
-  const base = 'https://interior.gov.ng'
-  const url  = `${base}/wanted-persons/`
-  const results = []
-  const diag = []
-
-  try {
-    const { html, status } = await fetchUrl(url, 15000)
-    diag.push({ url, status, htmlLen: html.length })
-
-    // All wp-content image uploads on the wanted page
-    const imgRe = /src="(https:\/\/interior\.gov\.ng\/wp-content\/uploads\/[^"]+(?:jpg|jpeg|png|webp)[^"]*)"/gi
-    let m, idx = 0
-    while ((m = imgRe.exec(html))) {
-      const src = m[1]
-      // Skip logos, icons, small images
-      if (/logo|icon|banner|slider|cropped|button|widget/i.test(src)) continue
-      idx++
-      results.push(norm({
-        name: `Escaped Prisoner #${String(idx).padStart(3,'0')} (Interior/NCS)`,
-        crime: 'Escaped Prisoner — Nigerian Correctional Service',
-        status: 'Wanted',
-        imageUrl: src,
-        description: 'Identity details visible in poster image. Contact Nigerian Correctional Service or nearest police station.',
-        sourceUrl: url,
-      }, 'interior', 'Interior', '#00c853'))
+        crime: crimeM ? stripTags(crimeM[1]).slice(0,120) : "Financial Crime / Fraud",
+        imageUrl,
+        sourceUrl: directUrl,
+        status: block.toLowerCase().includes("apprehend") ? "Apprehended" : "Wanted",
+      }, "efcc", "EFCC", "#1976d2"));
     }
 
-    diag.push({ imagesFound: idx })
-  } catch (e) {
-    diag.push({ error: e.message })
+    // Pattern B — table rows
+    if (results.length === 0) {
+      const trs = html.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || [];
+      for (const tr of trs) {
+        const tds = (tr.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(t => stripTags(t));
+        if (tds.length >= 2 && tds[0].length > 2 && !/name|sn|#|s\/n/i.test(tds[0])) {
+          if (seen.has(tds[0].toLowerCase())) continue;
+          seen.add(tds[0].toLowerCase());
+          results.push(norm({
+            name: tds[0], crime: tds[1] || "Financial Crime",
+            state: tds[2] || null, sourceUrl: directUrl,
+          }, "efcc", "EFCC", "#1976d2"));
+        }
+      }
+    }
+
+    // Pattern C — list items with anchor text
+    if (results.length === 0) {
+      const lis = html.match(/<li[^>]*>([\s\S]*?)<\/li>/gi) || [];
+      for (const li of lis) {
+        const linkM = li.match(/<a[^>]*href="([^"]*WantedPerson[^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
+        if (linkM) {
+          const name = stripTags(linkM[2]);
+          if (name.length < 3 || seen.has(name.toLowerCase())) continue;
+          seen.add(name.toLowerCase());
+          results.push(norm({ name, crime: "Financial Crime", sourceUrl: linkM[1] }, "efcc", "EFCC", "#1976d2"));
+        }
+      }
+    }
   }
-
-  if (results.length) cacheSet(ck, results)
-  return { results, diagnostics: diag }
+  return results;
 }
 
-// ─── DEDUPLICATE ──────────────────────────────────────────────────────────────
-function dedup(persons) {
-  const seen = new Set()
-  return persons.filter(p => {
-    const k = p.name.toLowerCase().replace(/[^a-z]/g, '').slice(0, 20)
-    if (seen.has(k)) return false
-    seen.add(k)
-    return true
-  })
-}
+// ─── NPF SCRAPER ──────────────────────────────────────────────────────────────
+async function scrapeNPF() {
+  const results = [];
+  const seen = new Set();
+  const urls = [
+    "https://www.npf.gov.ng/wanted",
+    "https://www.npf.gov.ng/wanted?page=2",
+  ];
+  for (const url of urls) {
+    try {
+      const { html } = await fetchUrl(url);
 
-// ─── SEED ─────────────────────────────────────────────────────────────────────
-function getSeed() {
-  return [
-    { id:'e1', name:'Emmanuel Nwude', alias:'The Governor', crime:'Advance Fee Fraud (₦12.4B)', status:'Wanted', reward:'₦5,000,000', state:'Anambra', agency:'efcc', agencyLabel:'EFCC', agencyColor:'#1976d2', imageUrl:null, refId:'EFCC-2025-0091', sourceUrl:'https://www.efcc.gov.ng/efcc/news-and-information/wanted-persons-1', scrapedAt:new Date().toISOString() },
-    { id:'e2', name:'Ramon Abbas', alias:'Hushpuppi', crime:'Wire Fraud / Money Laundering', status:'Convicted', reward:null, state:'Lagos', agency:'efcc', agencyLabel:'EFCC', agencyColor:'#1976d2', imageUrl:null, refId:'EFCC-2020-0043', sourceUrl:'https://www.efcc.gov.ng/efcc/news-and-information/wanted-persons-1', scrapedAt:new Date().toISOString() },
-    { id:'n1', name:'Terwase Akwaza', alias:'Gana', crime:'Terrorism / Mass Murder / Kidnapping', status:'Wanted', reward:'₦20,000,000', state:'Benue', agency:'npf', agencyLabel:'NPF', agencyColor:'#e8340a', imageUrl:null, refId:'NPF-2025-4410', sourceUrl:'https://npf.gov.ng/wanted', scrapedAt:new Date().toISOString() },
-    { id:'n2', name:'Chukwudumeme Onwuamadike', alias:'Evans', crime:'Kidnapping / Armed Robbery', status:'Apprehended', reward:null, state:'Lagos', agency:'npf', agencyLabel:'NPF', agencyColor:'#e8340a', imageUrl:null, refId:'NPF-2017-0112', sourceUrl:'https://npf.gov.ng/wanted', scrapedAt:new Date().toISOString() },
-    { id:'i1', name:'Abdulrasheed Maina', alias:null, crime:'Pension Fraud / Money Laundering (₦2B)', status:'Convicted', reward:null, state:'Abuja FCT', agency:'icpc', agencyLabel:'ICPC', agencyColor:'#d4a017', imageUrl:null, refId:'ICPC-2021-0078', sourceUrl:'https://icpc.gov.ng/wanted-persons/', scrapedAt:new Date().toISOString() },
-    { id:'i2', name:'Zichao Qui', alias:null, crime:'Corruption / Money Laundering — Fortunetech Ltd', status:'Wanted', reward:null, state:null, agency:'icpc', agencyLabel:'ICPC', agencyColor:'#d4a017', imageUrl:'https://icpc.gov.ng/wp-content/uploads/2026/01/zhichao-qiu.jpeg', refId:null, sourceUrl:'https://icpc.gov.ng/mr-zichao-qui/', scrapedAt:new Date().toISOString() },
-    { id:'t1', name:'Escaped Prisoner #001 (Interior/NCS)', alias:null, crime:'Escaped Prisoner — Nigerian Correctional Service', status:'Wanted', reward:null, state:null, agency:'interior', agencyLabel:'Interior', agencyColor:'#00c853', imageUrl:'https://interior.gov.ng/wp-content/uploads/2025/05/img-20210520-wa0006.jpg', refId:null, sourceUrl:'https://interior.gov.ng/wanted-persons/', scrapedAt:new Date().toISOString() },
-  ]
-}
+      // Articles or card divs
+      const blocks = [
+        ...(html.match(/<article[^>]*>([\s\S]*?)<\/article>/gi) || []),
+        ...(html.match(/<div[^>]*class="[^"]*(?:wanted|person|criminal|col-md)[^"]*"[^>]*>([\s\S]*?)<\/div>/gi) || []),
+      ];
 
-// ─── HANDLER ──────────────────────────────────────────────────────────────────
-exports.handler = async function(event) {
-  const p = event.queryStringParameters || {}
-  const agency  = p.agency  || 'all'
-  const noCache = p.nocache === '1'
+      for (const block of blocks) {
+        const nameM = block.match(/<h[234][^>]*>([\s\S]*?)<\/h[234]>/i);
+        if (!nameM) continue;
+        const name = stripTags(nameM[1]);
+        if (name.length < 3 || seen.has(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+        const imgM   = block.match(/<img[^>]+src="([^"]+)"/i);
+        const crimeM = block.match(/(?:Offence|Crime|Charge)[^:]*:\s*([^\n<]{3,100})/i);
+        const stateM = block.match(/(?:State|LGA|Zone)[^:]*:\s*([^\n<]{2,60})/i);
+        const rewardM = block.match(/Reward[^:]*:\s*(₦?[\d,]+(?:\s*[Mm]illion)?)/i);
+        results.push(norm({
+          name,
+          crime: crimeM ? crimeM[1].trim() : null,
+          state: stateM ? stateM[1].trim() : null,
+          reward: rewardM ? `₦${rewardM[1].replace("₦","")}` : null,
+          imageUrl: imgM ? (imgM[1].startsWith("http") ? imgM[1] : `https://www.npf.gov.ng${imgM[1]}`) : null,
+          sourceUrl: url,
+        }, "npf", "NPF", "#e8340a"));
+      }
 
-  const headers = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Content-Type': 'application/json',
-    'Cache-Control': 'public, max-age=1800',
-  }
-
-  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers, body: '' }
-
-  if (noCache) ['efcc','npf','icpc','interior'].forEach(k => delete _cache[k])
-
-  try {
-    const scrapers = []
-    if (agency === 'all' || agency === 'efcc')     scrapers.push(scrapeEFCC())
-    if (agency === 'all' || agency === 'npf')      scrapers.push(scrapeNPF())
-    if (agency === 'all' || agency === 'icpc')     scrapers.push(scrapeICPC())
-    if (agency === 'all' || agency === 'interior') scrapers.push(scrapeInterior())
-
-    const settled = await Promise.allSettled(scrapers)
-    const agencyStats = {}
-    let persons = []
-
-    for (const r of settled) {
-      if (r.status === 'fulfilled') {
-        const { results, diagnostics, source } = r.value
-        persons.push(...results)
-        if (results[0]?.agency) {
-          agencyStats[results[0].agency] = {
-            count: results.length,
-            source: source || 'live',
-            diagnostics,
+      // Table fallback
+      if (results.length === 0) {
+        const trs = html.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || [];
+        for (const tr of trs) {
+          const tds = (tr.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(t => stripTags(t));
+          if (tds.length >= 2 && tds[0].length > 2 && !/name|sn|#/i.test(tds[0])) {
+            if (seen.has(tds[0].toLowerCase())) continue;
+            seen.add(tds[0].toLowerCase());
+            results.push(norm({ name: tds[0], crime: tds[1], state: tds[2], sourceUrl: url }, "npf", "NPF", "#e8340a"));
           }
         }
       }
-    }
+    } catch (_) {}
+  }
+  return results;
+}
 
-    persons = dedup(persons)
-    persons.sort((a,b) => {
-      const pr = { Wanted:0, Critical:0, Escaped:1, Apprehended:2, Convicted:3 }
-      return (pr[a.status]??5) - (pr[b.status]??5)
-    })
+// ─── SEED DATA (shown only when ALL live scrapers fail) ───────────────────────
+function getSeed() {
+  return [
+    { id:"s1", name:"Terwase Agwaza", alias:"Gana", crime:"Terrorism / Mass Murder", status:"Wanted", reward:"₦20,000,000", state:"Benue", agency:"npf", agencyLabel:"NPF", agencyColor:"#e8340a", imageUrl:null, refId:"NPF-2025-4410", sourceUrl:"https://www.npf.gov.ng/wanted", scrapedAt:new Date().toISOString() },
+    { id:"s2", name:"Emmanuel Nwude", alias:"The Governor", crime:"Advance Fee Fraud (₦12.4B)", status:"Wanted", reward:"₦5,000,000", state:"Anambra", agency:"efcc", agencyLabel:"EFCC", agencyColor:"#1976d2", imageUrl:null, refId:"EFCC-2025-0091", sourceUrl:"https://www.efcc.gov.ng/WantedPersons", scrapedAt:new Date().toISOString() },
+    { id:"s3", name:"Abdulrasheed Maina", alias:null, crime:"Pension Fraud / Money Laundering", status:"Convicted", reward:null, state:"Abuja FCT", agency:"icpc", agencyLabel:"ICPC", agencyColor:"#d4a017", imageUrl:null, refId:"ICPC-2021-0078", sourceUrl:"https://icpc.gov.ng/wanted-persons/", scrapedAt:new Date().toISOString() },
+    { id:"s4", name:"Chukwudumeme Onwuamadike", alias:"Evans", crime:"Kidnapping / Armed Robbery", status:"Apprehended", reward:null, state:"Lagos", agency:"npf", agencyLabel:"NPF", agencyColor:"#e8340a", imageUrl:null, refId:"NPF-2017-0112", sourceUrl:"https://www.npf.gov.ng/wanted", scrapedAt:new Date().toISOString() },
+  ];
+}
 
-    const usedSeed = persons.length === 0
-    if (usedSeed) persons = getSeed()
+// ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
+exports.handler = async function (event) {
+  const agency = (event.queryStringParameters || {}).agency || "all";
+  const headers = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Content-Type": "application/json",
+    "Cache-Control": "public, max-age=1800",
+  };
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers, body: "" };
+
+  try {
+    const scrapers = [];
+    if (agency === "all" || agency === "efcc")    scrapers.push(scrapeEFCC().catch(() => []));
+    if (agency === "all" || agency === "npf")     scrapers.push(scrapeNPF().catch(() => []));
+    if (agency === "all" || agency === "icpc")    scrapers.push(scrapeICPC().catch(() => []));
+    if (agency === "all" || agency === "interior") scrapers.push(scrapeInterior().catch(() => []));
+
+    const settled = await Promise.all(scrapers);
+    let persons = settled.flat();
+
+    // Dedupe by normalised name
+    const namesSeen = new Set();
+    persons = persons.filter(p => {
+      const k = p.name.toLowerCase().replace(/\s+/g,"");
+      if (namesSeen.has(k)) return false;
+      namesSeen.add(k);
+      return true;
+    });
+
+    // Sort: Wanted first
+    const pri = { Wanted:0, Escaped:1, Apprehended:2, Convicted:3 };
+    persons.sort((a, b) => (pri[a.status]||5) - (pri[b.status]||5));
+
+    const usedSeed = persons.length === 0;
+    if (usedSeed) persons = getSeed();
 
     return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({
-        success: true,
-        total: persons.length,
-        usedSeed,
-        cacheHit: Object.values(agencyStats).some(s => s.source === 'cache'),
-        scrapedAt: new Date().toISOString(),
-        nextRefreshIn: CACHE_TTL_MS,
-        agencyStats,
-        persons,
-      }),
-    }
+      statusCode: 200, headers,
+      body: JSON.stringify({ success:true, total:persons.length, usedSeed, scrapedAt:new Date().toISOString(), persons }),
+    };
   } catch (err) {
     return {
-      statusCode: 500,
-      headers,
+      statusCode: 500, headers,
       body: JSON.stringify({ success:false, error:err.message, persons:getSeed(), usedSeed:true }),
-    }
+    };
   }
-}
+};

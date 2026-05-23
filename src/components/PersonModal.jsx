@@ -77,9 +77,9 @@ export default function PersonModal({ person, onClose }) {
               overflow: 'hidden', marginBottom: 12,
             }}>
               {person.imageUrl ? (
-                <img src={person.imageUrl} alt={person.name}
+                <img src={person.imageUrl ? `https://wsrv.nl/?url=${encodeURIComponent(person.imageUrl)}&w=400&h=500&fit=cover&we` : ""} alt={person.name}
                   style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
-                  onError={e => e.target.style.display = 'none'}
+                  onError={e => { if (e.target.src !== person.imageUrl) { e.target.src = person.imageUrl } else { e.target.style.display = "none" } }}
                 />
               ) : (
                 <div style={{
