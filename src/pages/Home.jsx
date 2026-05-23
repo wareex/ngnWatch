@@ -5,6 +5,7 @@ import FilterSidebar from '../components/FilterSidebar'
 import WantedCard from '../components/WantedCard'
 import PersonModal from '../components/PersonModal'
 import { useWantedPersons } from '../hooks/useWantedPersons'
+import { useBreakpoint } from '../hooks/useBreakpoint'
 import { filterPersons, timeAgo, formatDate } from '../utils/helpers'
 
 const SKELETON_COUNT = 8
@@ -13,11 +14,14 @@ export default function Home() {
   const { persons, loading, refreshing, error, meta, lastFetched, refetch, forceRefetch } =
     useWantedPersons('all')
 
+  const { isMobile, isTablet } = useBreakpoint()
+
   const [selectedPerson, setSelectedPerson]   = useState(null)
   const [activeAgency, setActiveAgency]       = useState('all')
   const [filters, setFilters]                 = useState({
     query: '', category: 'All Categories', status: 'all', state: 'All States',
   })
+  const [filterOpen, setFilterOpen]           = useState(false)
   const [countdown, setCountdown]             = useState(null)
   const timerRef                              = useRef(null)
 
@@ -36,14 +40,18 @@ export default function Home() {
     return () => clearInterval(timerRef.current)
   }, [lastFetched, meta.nextRefreshIn])
 
-  // ── Agency counts ──────────────────────────────────────────────────────────
+  // Lock body scroll when filter drawer is open on mobile
+  useEffect(() => {
+    document.body.style.overflow = filterOpen ? 'hidden' : ''
+    return () => { document.body.style.overflow = '' }
+  }, [filterOpen])
+
   const agencyCounts = useMemo(() => {
     const counts = { all: persons.length }
     persons.forEach(p => { counts[p.agency] = (counts[p.agency] || 0) + 1 })
     return counts
   }, [persons])
 
-  // ── Filtered results ───────────────────────────────────────────────────────
   const filtered = useMemo(
     () => filterPersons(persons, { ...filters, agency: activeAgency }),
     [persons, filters, activeAgency]
@@ -55,7 +63,9 @@ export default function Home() {
   }
 
   const isStale = meta.scrapedAt &&
-    Date.now() - new Date(meta.scrapedAt).getTime() > 60 * 60 * 1000 // > 1 hr
+    Date.now() - new Date(meta.scrapedAt).getTime() > 60 * 60 * 1000
+
+  const pad = isMobile ? '0.875rem' : '1.25rem'
 
   return (
     <div className="page-enter">
@@ -63,14 +73,13 @@ export default function Home() {
 
       <AgencyBar active={activeAgency} onChange={handleAgencyChange} counts={agencyCounts} />
 
-      {/* ── Status Bar ─────────────────────────────────────────────────────── */}
+      {/* ── Status Bar ─────────────────────────────────────────────────── */}
       <div style={{
         borderBottom: '1px solid var(--border)',
-        padding: '6px 2rem',
-        display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
+        padding: `6px ${pad}`,
+        display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
         background: 'var(--surface)',
       }}>
-        {/* Live / Demo indicator */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{
             width: 7, height: 7, borderRadius: '50%',
@@ -84,7 +93,6 @@ export default function Home() {
           </span>
         </div>
 
-        {/* Scraped at */}
         {meta.scrapedAt && (
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)' }}>
             Scraped: {formatDate(meta.scrapedAt)}
@@ -92,29 +100,25 @@ export default function Home() {
           </span>
         )}
 
-        {/* Cache indicator */}
         {meta.cacheHit && !meta.usedSeed && (
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)' }}>
             · Served from cache
           </span>
         )}
 
-        {/* Countdown */}
         {countdown && !meta.usedSeed && (
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text3)' }}>
             · Next refresh in <span style={{ color: 'var(--text2)' }}>{countdown}</span>
           </span>
         )}
 
-        {/* Refreshing spinner */}
         {refreshing && (
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--accent2)', marginLeft: 'auto' }}>
             ↻ Refreshing…
           </span>
         )}
 
-        {/* Per-agency live stats */}
-        {!meta.usedSeed && Object.keys(meta.agencyStats).length > 0 && (
+        {!meta.usedSeed && Object.keys(meta.agencyStats).length > 0 && !isMobile && (
           <div style={{ display: 'flex', gap: 10, marginLeft: 'auto', flexWrap: 'wrap' }}>
             {Object.entries(meta.agencyStats).map(([ag, stat]) => (
               <span key={ag} style={{ fontFamily: 'var(--mono)', fontSize: 8, color: 'var(--text3)' }}>
@@ -128,17 +132,17 @@ export default function Home() {
         )}
       </div>
 
-      {/* ── Demo / error banner ────────────────────────────────────────────── */}
+      {/* ── Demo / error banner ──────────────────────────────────────────── */}
       {(meta.usedSeed || error) && (
         <div style={{
           background: 'rgba(212,160,23,0.07)',
           borderBottom: '1px solid rgba(212,160,23,0.2)',
-          padding: '8px 2rem', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+          padding: `8px ${pad}`, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
         }}>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--gold)', flex: 1 }}>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--gold)', flex: 1, minWidth: 200 }}>
             {error
               ? `⚠ Scraper error: ${error} — showing demo records.`
-              : '⚠ DEMO MODE — Live agency scraping unavailable. Deploy the serverless function to load live data.'}
+              : '⚠ DEMO MODE — Live agency scraping unavailable.'}
           </span>
           <button className="btn btn-ghost" style={{ fontSize: 9, padding: '4px 10px' }}
             onClick={() => refetch(activeAgency)}>
@@ -151,72 +155,110 @@ export default function Home() {
         </div>
       )}
 
-      {/* ── Main Layout ───────────────────────────────────────────────────── */}
+      {/* ── Main Layout ─────────────────────────────────────────────────── */}
       <main style={{
-        maxWidth: 1400, margin: '0 auto', padding: '2rem',
-        display: 'grid', gridTemplateColumns: '268px 1fr', gap: '2rem',
+        maxWidth: 1400, margin: '0 auto', padding: `1.25rem ${pad}`,
+        display: isTablet ? 'block' : 'grid',
+        gridTemplateColumns: '268px 1fr',
+        gap: '1.5rem',
       }}>
-        <FilterSidebar
-          filters={filters}
-          setFilters={setFilters}
-          total={filtered.length}
-          onFaceSearch={() => alert('Face recognition requires agency-level login.')}
-        />
+
+        {/* DESKTOP: sidebar inline | MOBILE/TABLET: drawer */}
+        {isTablet ? (
+          <>
+            {/* Mobile filter toggle */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.875rem', gap: 8 }}>
+              <button
+                className="btn btn-outline"
+                style={{ fontSize: 10, gap: 7 }}
+                onClick={() => setFilterOpen(true)}
+              >
+                <span>⊟</span> Filters
+                {(filters.query || filters.category !== 'All Categories' || filters.status !== 'all' || filters.state !== 'All States') && (
+                  <span style={{ background: 'var(--accent)', color: '#fff', borderRadius: 8, padding: '1px 5px', fontSize: 8 }}>•</span>
+                )}
+              </button>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text2)' }}>
+                <strong style={{ color: 'var(--text)' }}>{filtered.length}</strong> records
+              </span>
+            </div>
+
+            {/* Drawer overlay */}
+            <div className={`filter-drawer-overlay${filterOpen ? ' open' : ''}`} onClick={() => setFilterOpen(false)} />
+            <div className={`filter-drawer${filterOpen ? ' open' : ''}`}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text3)', letterSpacing: '0.2em' }}>FILTERS</span>
+                <button onClick={() => setFilterOpen(false)} style={{
+                  background: 'none', border: '1px solid var(--border)', borderRadius: 2,
+                  color: 'var(--text3)', cursor: 'pointer', width: 30, height: 30,
+                  fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }}>✕</button>
+              </div>
+              <FilterSidebar
+                filters={filters}
+                setFilters={(f) => { setFilters(f); setFilterOpen(false) }}
+                total={filtered.length}
+                onFaceSearch={() => { setFilterOpen(false); alert('Face recognition requires agency-level login.') }}
+              />
+            </div>
+          </>
+        ) : (
+          <FilterSidebar
+            filters={filters}
+            setFilters={setFilters}
+            total={filtered.length}
+            onFaceSearch={() => alert('Face recognition requires agency-level login.')}
+          />
+        )}
 
         <div>
           {/* Results header */}
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            marginBottom: '1rem', flexWrap: 'wrap', gap: 8,
-          }}>
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text2)' }}>
-              {loading
-                ? 'Loading records…'
-                : error && persons.length === 0
-                  ? <span style={{ color: 'var(--accent)' }}>⚠ {error}</span>
-                  : <>
-                      <strong style={{ color: 'var(--text)' }}>{filtered.length}</strong> records
-                      {filtered.length !== persons.length && ` (filtered from ${persons.length})`}
-                      {' · '}sorted by threat level
-                      {lastFetched && (
-                        <span style={{ color: 'var(--text3)', marginLeft: 8 }}>
-                          · updated {timeAgo(lastFetched.toISOString())}
-                        </span>
-                      )}
-                    </>
-              }
+          {!isTablet && (
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              marginBottom: '1rem', flexWrap: 'wrap', gap: 8,
+            }}>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text2)' }}>
+                {loading
+                  ? 'Loading records…'
+                  : error && persons.length === 0
+                    ? <span style={{ color: 'var(--accent)' }}>⚠ {error}</span>
+                    : <>
+                        <strong style={{ color: 'var(--text)' }}>{filtered.length}</strong> records
+                        {filtered.length !== persons.length && ` (filtered from ${persons.length})`}
+                        {' · '}sorted by threat level
+                        {lastFetched && (
+                          <span style={{ color: 'var(--text3)', marginLeft: 8 }}>
+                            · updated {timeAgo(lastFetched.toISOString())}
+                          </span>
+                        )}
+                      </>
+                }
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn btn-ghost" style={{ fontSize: 10, padding: '6px 12px' }}
+                  disabled={loading || refreshing} onClick={() => refetch(activeAgency)}>
+                  {refreshing ? '↻ Refreshing…' : '↻ Refresh'}
+                </button>
+                <button className="btn btn-outline" style={{ fontSize: 10, padding: '6px 12px' }}
+                  disabled={loading || refreshing} onClick={() => forceRefetch(activeAgency)}
+                  title="Force re-scrape — bypasses server cache">
+                  ⚡ Force Update
+                </button>
+              </div>
             </div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <button
-                className="btn btn-ghost"
-                style={{ fontSize: 10, padding: '6px 12px' }}
-                disabled={loading || refreshing}
-                onClick={() => refetch(activeAgency)}
-              >
-                {refreshing ? '↻ Refreshing…' : '↻ Refresh'}
-              </button>
-              <button
-                className="btn btn-outline"
-                style={{ fontSize: 10, padding: '6px 12px' }}
-                disabled={loading || refreshing}
-                onClick={() => forceRefetch(activeAgency)}
-                title="Force re-scrape — bypasses server cache"
-              >
-                ⚡ Force Update
-              </button>
-            </div>
-          </div>
+          )}
 
           {/* High-priority alert banner */}
           {!loading && filtered.some(p => p.status === 'Wanted' && p.reward) && (
             <div style={{
               background: 'rgba(232,52,10,0.08)', border: '1px solid rgba(232,52,10,0.3)',
-              borderRadius: 2, padding: '12px 16px', marginBottom: '1rem',
-              display: 'flex', alignItems: 'center', gap: 14,
+              borderRadius: 2, padding: isMobile ? '10px 12px' : '12px 16px', marginBottom: '1rem',
+              display: 'flex', alignItems: 'center', gap: 12,
             }}>
-              <span style={{ fontSize: 22, flexShrink: 0 }}>🚨</span>
+              <span style={{ fontSize: isMobile ? 18 : 22, flexShrink: 0 }}>🚨</span>
               <div>
-                <div style={{ fontFamily: 'var(--display)', fontSize: 18, color: 'var(--accent)', letterSpacing: '0.05em' }}>
+                <div style={{ fontFamily: 'var(--display)', fontSize: isMobile ? 14 : 18, color: 'var(--accent)', letterSpacing: '0.05em' }}>
                   HIGH-PRIORITY WARRANTS ACTIVE
                 </div>
                 <p style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text2)', marginTop: 2 }}>
@@ -229,14 +271,13 @@ export default function Home() {
 
           {/* Grid */}
           {loading ? (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(230px,1fr))', gap: '1rem' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill,minmax(${isMobile ? '160px' : '230px'},1fr))`, gap: isMobile ? '0.75rem' : '1rem' }}>
               {Array.from({ length: SKELETON_COUNT }).map((_, i) => (
                 <div key={i} style={{ borderRadius: 2, overflow: 'hidden', border: '1px solid var(--border)' }}>
-                  <div className="skeleton" style={{ height: 180 }} />
+                  <div className="skeleton" style={{ height: isMobile ? 150 : 180 }} />
                   <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8 }}>
                     <div className="skeleton" style={{ height: 20, width: '70%' }} />
                     <div className="skeleton" style={{ height: 12, width: '50%' }} />
-                    <div className="skeleton" style={{ height: 10, width: '85%' }} />
                   </div>
                 </div>
               ))}
@@ -252,7 +293,7 @@ export default function Home() {
               </p>
             </div>
           ) : (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(230px,1fr))', gap: '1rem' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill,minmax(${isMobile ? '155px' : '230px'},1fr))`, gap: isMobile ? '0.75rem' : '1rem' }}>
               {filtered.map(person => (
                 <WantedCard key={person.id} person={person} onClick={setSelectedPerson} />
               ))}

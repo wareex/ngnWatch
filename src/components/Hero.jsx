@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useBreakpoint } from '../hooks/useBreakpoint'
 import { timeAgo } from '../utils/helpers'
 
 function Counter({ target, duration = 1500, color }) {
@@ -30,17 +31,20 @@ const TICKER_ITEMS = [
 ]
 
 export default function Hero({ total, scrapedAt, usedSeed }) {
+  const { isMobile } = useBreakpoint()
+
   return (
     <section style={{
       position: 'relative',
       background: 'linear-gradient(135deg,#0d1117 0%,#111318 50%,#0d1117 100%)',
       borderBottom: '1px solid var(--border)',
-      overflow: 'hidden', padding: '3rem 2rem',
+      overflow: 'hidden',
+      padding: isMobile ? '1.75rem 0.875rem' : '3rem 1.25rem',
     }}>
       {/* BG watermark */}
       <div style={{
         position: 'absolute', left: -20, top: -20,
-        fontFamily: 'var(--display)', fontSize: 220, color: 'rgba(232,52,10,0.03)',
+        fontFamily: 'var(--display)', fontSize: isMobile ? 120 : 220, color: 'rgba(232,52,10,0.03)',
         lineHeight: 1, pointerEvents: 'none', userSelect: 'none', letterSpacing: '0.05em',
       }}>NGA</div>
 
@@ -49,7 +53,7 @@ export default function Hero({ total, scrapedAt, usedSeed }) {
         <div style={{
           display: 'inline-flex', alignItems: 'center', gap: 8,
           background: 'rgba(232,52,10,0.1)', border: '1px solid rgba(232,52,10,0.3)',
-          padding: '4px 12px', borderRadius: 2, marginBottom: '1rem',
+          padding: '4px 12px', borderRadius: 2, marginBottom: '0.875rem',
         }}>
           <div className="pulse-dot" style={{ width: 6, height: 6 }} />
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--accent)', letterSpacing: '0.2em' }}>
@@ -59,31 +63,34 @@ export default function Hero({ total, scrapedAt, usedSeed }) {
 
         <h1 style={{
           fontFamily: 'var(--display)',
-          fontSize: 'clamp(44px,7vw,88px)',
+          fontSize: 'clamp(36px,7vw,88px)',
           lineHeight: 0.95, letterSpacing: '0.05em', color: 'var(--text)',
-          marginBottom: '1rem',
+          marginBottom: '0.875rem',
         }}>
           NIGERIAN<br />
           <span style={{ color: 'var(--accent)' }}>WANTED</span><br />
           CATALOGUE
         </h1>
 
-        <p style={{ fontSize: 14, color: 'var(--text2)', maxWidth: 560, marginBottom: '1.5rem', lineHeight: 1.65, fontWeight: 300 }}>
-          Unified law enforcement intelligence platform consolidating wanted persons published by EFCC, NPF, ICPC, and Ministry of Interior. Searchable by name, crime, agency, and state.
-        </p>
+        {!isMobile && (
+          <p style={{ fontSize: 14, color: 'var(--text2)', maxWidth: 560, marginBottom: '1.25rem', lineHeight: 1.65, fontWeight: 300 }}>
+            Unified law enforcement intelligence platform consolidating wanted persons published by EFCC, NPF, ICPC, and Ministry of Interior.
+            Searchable by name, crime, agency, and state.
+          </p>
+        )}
 
         {/* Stats */}
-        <div style={{ display: 'flex', gap: '2.5rem', flexWrap: 'wrap', marginBottom: '1.5rem' }}>
-          <Stat num={<Counter target={total || 0} color="var(--accent)" />} label="Records Loaded" />
+        <div style={{ display: 'flex', gap: isMobile ? '1.25rem' : '2.5rem', flexWrap: 'wrap', marginBottom: '1.25rem' }}>
+          <Stat num={<Counter target={total || 0} color="var(--accent)" />} label="Records" />
           <Stat num={<Counter target={Math.round((total || 0) * 0.61)} color="var(--gold)" duration={1200} />} label="Active Warrants" />
-          <Stat num={<Counter target={Math.round((total || 0) * 0.28)} color="var(--green)" duration={1800} />} label="Apprehended YTD" />
-          <Stat num={<Counter target={4} />} label="Agency Sources" />
+          <Stat num={<Counter target={Math.round((total || 0) * 0.28)} color="var(--green)" duration={1800} />} label="Apprehended" />
+          <Stat num={<Counter target={4} />} label="Agencies" />
         </div>
 
         {/* Ticker */}
         <div style={{
           background: 'rgba(232,52,10,0.07)', border: '1px solid rgba(232,52,10,0.18)',
-          padding: '8px 16px', display: 'flex', alignItems: 'center', gap: 14,
+          padding: '7px 14px', display: 'flex', alignItems: 'center', gap: 12,
           borderRadius: 2, overflow: 'hidden',
         }}>
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--accent)', letterSpacing: '0.2em', flexShrink: 0 }}>
