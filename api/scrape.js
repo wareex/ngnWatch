@@ -1,399 +1,568 @@
 /**
- * NGA-WATCH — Netlify Serverless Scraper  v4.0
- * ─────────────────────────────────────────────
- * Built from live HTML/markdown inspection of each agency (May 2025):
+ * NGA-WATCH Scraper v4 — Netlify Serverless Function
  *
- * ICPC:    WordPress/Elementor. web_fetch returns markdown where every person
- *          appears as two consecutive lines:
- *            [![img-title](IMAGE_URL)](DETAIL_URL)
- *            # [FULL NAME](DETAIL_URL)
- *          29 persons confirmed on single page.
+ * EFCC SITUATION (confirmed by live inspection):
+ *   - https://www.efcc.gov.ng/WantedPersons?page=1 is a Next.js SPA page.
+ *     A server-side HTTP request gets back an HTML shell with NO wanted person data.
+ *     The data loads via Next.js hydration / client-side JS — invisible to scrapers.
+ *   - Direct HTML requests return 403 on the Joomla legacy URLs.
  *
- * EFCC:    Joomla CMS. Real URL = /efcc/news-and-information/wanted-persons-1
- *          Paginated ?start=0, ?start=18, ?start=36 … (18 per page, ~60+ total).
- *          Site returns 403 to Node fetch; must use allorigins.win proxy.
- *          Each item: <div class="items-row"> with <img> and <a> title.
+ *   SOLUTION: Probe the Next.js internal data endpoints that Next.js uses to
+ *   server-side render / pre-render pages:
+ *     /_next/data/{buildId}/WantedPersons.json?page=1
+ *   We first fetch the HTML shell to extract the current buildId, then call
+ *   the data endpoint directly.  If that fails we fall back to fetching each
+ *   known individual wanted-person slug from the older Joomla URL pattern.
  *
- * Interior: WordPress. Raw <img> tags only, no names. ~18 images.
- *
- * NPF:     Standard WordPress. Articles with <h2>/<h3> names + <img>.
+ * NPF: individual detail pages at /wanted/details/{id} (SSL ignored, sequential probe)
+ * ICPC: WordPress — list page → individual pages (confirmed working)
+ * Interior: images-only page — extract poster image URLs (names inside images)
  */
 
 const https = require('https')
 const http  = require('http')
 
-// ─── HTTP FETCH ───────────────────────────────────────────────────────────────
-function fetchUrl(url, timeoutMs = 15000) {
+// ─── CACHE ────────────────────────────────────────────────────────────────────
+const CACHE_TTL = 30 * 60 * 1000  // 30 min
+const _cache = {}
+function cacheGet(k) {
+  const e = _cache[k]
+  if (!e || Date.now() - e.ts > CACHE_TTL) { delete _cache[k]; return null }
+  return e.data
+}
+function cacheSet(k, d) { _cache[k] = { ts: Date.now(), data: d } }
+
+// ─── HTTP ─────────────────────────────────────────────────────────────────────
+function fetchUrl(url, opts = {}) {
+  const { timeout = 18000, headers = {}, rejectUnauth = false } = opts
   return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https') ? https : http
-    const req = lib.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-      },
-      timeout: timeoutMs,
-    }, (res) => {
-      if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
-        const loc = res.headers.location
-        const next = loc.startsWith('http') ? loc : new URL(loc, url).href
-        return fetchUrl(next, timeoutMs).then(resolve).catch(reject)
-      }
-      const chunks = []
-      res.on('data', c => chunks.push(c))
-      res.on('end', () => resolve({ html: Buffer.concat(chunks).toString('utf8'), status: res.statusCode }))
-    })
-    req.on('error', reject)
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout: ' + url)) })
+    const defaultHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Cache-Control': 'no-cache',
+      ...headers,
+    }
+    let hops = 0
+    function go(target) {
+      const lib = target.startsWith('https') ? https : http
+      const req = lib.get(target, { headers: defaultHeaders, timeout, rejectUnauthorized: rejectUnauth }, res => {
+        if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location && hops++ < 5) {
+          const next = res.headers.location.startsWith('http')
+            ? res.headers.location
+            : new URL(res.headers.location, target).href
+          return go(next)
+        }
+        const chunks = []
+        res.on('data', c => chunks.push(c))
+        res.on('end', () => resolve({ html: Buffer.concat(chunks).toString('utf8'), status: res.statusCode, finalUrl: target }))
+        res.on('error', reject)
+      })
+      req.on('error', reject)
+      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout ' + target)) })
+    }
+    go(url)
   })
 }
 
-// Fetch via allorigins.win proxy (bypasses 403 on EFCC)
-async function fetchViaProxy(url, timeoutMs = 18000) {
-  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}&timestamp=${Date.now()}`
-  const res = await fetchUrl(proxyUrl, timeoutMs)
-  const json = JSON.parse(res.html)
-  if (!json.contents) throw new Error('Proxy returned empty contents for ' + url)
-  return { html: json.contents, status: 200 }
+// Fetch JSON endpoint
+async function fetchJSON(url, opts = {}) {
+  const r = await fetchUrl(url, { ...opts, headers: { ...opts.headers, 'Accept': 'application/json, text/plain, */*' } })
+  return JSON.parse(r.html)
 }
 
-function strip(str) {
-  return (str || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&').replace(/&#039;/g, "'").replace(/&nbsp;/g, ' ')
-    .replace(/&quot;/g, '"').replace(/&#8217;/g, "'").replace(/&#8216;/g, "'")
-    .replace(/\s+/g, ' ').trim()
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+function strip(s = '') {
+  return s.replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&')
+    .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'")
+    .replace(/\s+/g,' ').trim()
 }
-
-let uid = 0
-function record(raw, agency, agencyLabel, agencyColor) {
+function resolve(src, base) {
+  if (!src) return null
+  if (src.startsWith('http')) return src
+  if (src.startsWith('//')) return 'https:' + src
+  try { return new URL(src, base).href } catch { return null }
+}
+let _seq = 0
+function norm(raw, agency, label, color) {
   return {
-    id:          `${agency}-${Date.now()}-${++uid}`,
-    name:        (raw.name || 'Unknown').replace(/\s+/g, ' ').trim(),
-    alias:       raw.alias  || null,
-    crime:       raw.crime  || 'Not specified',
-    status:      raw.status || 'Wanted',
-    reward:      raw.reward || null,
-    state:       raw.state  || null,
-    imageUrl:    raw.imageUrl || null,
-    description: raw.description || null,
-    refId:       raw.refId  || null,
-    agency, agencyLabel, agencyColor,
-    sourceUrl:   raw.sourceUrl || null,
-    scrapedAt:   new Date().toISOString(),
+    id: `${agency}-${Date.now()}-${++_seq}`,
+    name: (raw.name || 'Unknown').replace(/\s+/g,' ').trim(),
+    alias: raw.alias || null,
+    crime: (raw.crime || 'Not specified').slice(0, 300),
+    status: raw.status || 'Wanted',
+    reward: raw.reward || null,
+    state: raw.state || null,
+    imageUrl: raw.imageUrl || null,
+    description: raw.description ? raw.description.slice(0,600) : null,
+    refId: raw.refId || null,
+    agency, agencyLabel: label, agencyColor: color,
+    sourceUrl: raw.sourceUrl || null,
+    scrapedAt: new Date().toISOString(),
   }
 }
 
-// ─── ICPC ─────────────────────────────────────────────────────────────────────
-// The page renders as markdown-like text where each person is two lines:
-//   [![img-alt](https://icpc.gov.ng/wp-content/.../thumbs/xxx.jpeg "title")](https://icpc.gov.ng/slug/)
-//   # [FULL NAME](https://icpc.gov.ng/slug/)
-//
-// We parse both raw HTML img+link pairs AND the rendered markdown fallback.
-async function scrapeICPC() {
-  const url = 'https://icpc.gov.ng/wanted-persons/'
-  const { html } = await fetchUrl(url)
+// ─── EFCC SCRAPER ─────────────────────────────────────────────────────────────
+async function scrapeEFCC() {
+  const ck = 'efcc'
+  const cached = cacheGet(ck)
+  if (cached) return { results: cached, source: 'cache' }
+
+  const base = 'https://www.efcc.gov.ng'
   const results = []
-  const seen = new Set()
+  const diag = []
 
-  // Strategy A: parse raw HTML for the elementor image+link pattern
-  // Pattern: <a href="https://icpc.gov.ng/SLUG/"><img ... src="URL" title="NAME" ...></a>
-  // Followed nearby by: <h1 ...><a href="https://icpc.gov.ng/SLUG/">NAME</a></h1>
-  //
-  // Step 1: collect all (detailUrl -> imageUrl) from img-inside-link blocks
-  const imgLinkRe = /<a\s+href="(https:\/\/icpc\.gov\.ng\/[^"#?]+\/)"[^>]*>\s*<img[^>]+src="(https:\/\/icpc\.gov\.ng\/wp-content\/uploads\/elementor\/thumbs\/[^"]+)"[^>]*(?:title="([^"]*)")?[^>]*>\s*<\/a>/gi
-  const imgMap = new Map() // detailUrl -> {imageUrl, titleFromImg}
-  let m
-  while ((m = imgLinkRe.exec(html)) !== null) {
-    const detailUrl = m[1]
-    const imageUrl  = m[2]
-    const imgTitle  = m[3] ? strip(m[3]) : ''
-    if (!imgMap.has(detailUrl)) imgMap.set(detailUrl, { imageUrl, imgTitle })
+  // ── Strategy 1: Next.js data API ──────────────────────────────────────────
+  // The EFCC site is Next.js. Fetch the HTML shell to grab the buildId,
+  // then call the internal /_next/data/{buildId}/WantedPersons.json endpoint.
+  try {
+    const shell = await fetchUrl(`${base}/WantedPersons`, { timeout: 15000 })
+    diag.push({ step: 'shell', status: shell.status, len: shell.html.length })
+
+    // Extract Next.js buildId from __NEXT_DATA__ script tag
+    const buildM = shell.html.match(/"buildId"\s*:\s*"([^"]+)"/)
+    const propsM = shell.html.match(/"props"\s*:\s*(\{[\s\S]{0,5000}?\})\s*,\s*"page"/)
+
+    if (buildM) {
+      const buildId = buildM[1]
+      diag.push({ buildId })
+
+      // Try each page of the Next.js data endpoint
+      for (let page = 1; page <= 10; page++) {
+        try {
+          const dataUrl = `${base}/_next/data/${buildId}/WantedPersons.json?page=${page}`
+          const json = await fetchJSON(dataUrl, { timeout: 12000 })
+          diag.push({ page, dataUrl, keys: Object.keys(json) })
+
+          // Navigate the Next.js page props structure
+          const pageProps = json?.pageProps || json?.props?.pageProps || {}
+          const list = pageProps?.wantedPersons
+            || pageProps?.persons
+            || pageProps?.data
+            || pageProps?.wanted
+            || pageProps?.results
+            || (Array.isArray(pageProps) ? pageProps : null)
+
+          if (list && list.length > 0) {
+            diag.push({ page, found: list.length })
+            for (const p of list) {
+              results.push(norm({
+                name: p.name || p.fullName || p.full_name || p.firstName + ' ' + p.lastName,
+                alias: p.alias || p.otherName || p.aka || null,
+                crime: p.crime || p.offence || p.charge || p.offenceType || null,
+                state: p.state || p.stateOfOrigin || p.location || null,
+                reward: p.reward ? `₦${p.reward}` : null,
+                imageUrl: p.image || p.photo || p.imageUrl || p.img
+                  ? resolve(p.image || p.photo || p.imageUrl || p.img, base) : null,
+                status: p.status || (p.apprehended ? 'Apprehended' : 'Wanted'),
+                refId: p.id || p.refId || p.caseId || p.ref || null,
+                description: p.description || p.details || p.summary || null,
+                sourceUrl: `${base}/WantedPersons?page=${page}`,
+              }, 'efcc', 'EFCC', '#1976d2'))
+            }
+            // Check pagination — if fewer than expected, we're done
+            const total = pageProps?.total || pageProps?.count || pageProps?.totalCount || null
+            if (total && results.length >= total) break
+            if (list.length < 10) break
+          } else {
+            diag.push({ page, note: 'no list found in pageProps', pagePropsKeys: Object.keys(pageProps) })
+            break
+          }
+        } catch (e) {
+          diag.push({ page, nextDataError: e.message })
+          break
+        }
+      }
+    }
+
+    // ── Strategy 2: parse __NEXT_DATA__ inline JSON ──────────────────────────
+    if (results.length === 0) {
+      const nextDataM = shell.html.match(/<script id="__NEXT_DATA__"[^>]*>(\{[\s\S]*?\})<\/script>/)
+      if (nextDataM) {
+        try {
+          const nd = JSON.parse(nextDataM[1])
+          diag.push({ nextData: true, keys: Object.keys(nd?.props?.pageProps || {}) })
+          const pp = nd?.props?.pageProps || {}
+          const list = pp.wantedPersons || pp.persons || pp.data || pp.wanted || pp.results
+          if (list && list.length > 0) {
+            for (const p of list) {
+              results.push(norm({
+                name: p.name || p.fullName || p.full_name,
+                alias: p.alias || p.aka || null,
+                crime: p.crime || p.offence || p.charge || null,
+                state: p.state || p.stateOfOrigin || null,
+                imageUrl: p.image || p.photo ? resolve(p.image || p.photo, base) : null,
+                status: p.status || 'Wanted',
+                refId: p.id || p.refId || null,
+                sourceUrl: `${base}/WantedPersons`,
+              }, 'efcc', 'EFCC', '#1976d2'))
+            }
+          }
+        } catch (e) {
+          diag.push({ nextDataParseError: e.message })
+        }
+      }
+    }
+
+    // ── Strategy 3: try common REST API patterns ─────────────────────────────
+    if (results.length === 0) {
+      const apiPaths = [
+        '/api/wanted-persons',
+        '/api/wantedPersons',
+        '/api/wanted',
+        '/api/persons/wanted',
+        '/api/v1/wanted-persons',
+      ]
+      for (const path of apiPaths) {
+        try {
+          const json = await fetchJSON(`${base}${path}?page=1`, { timeout: 10000 })
+          const list = json?.data || json?.persons || json?.results || json?.wantedPersons
+          if (Array.isArray(list) && list.length > 0) {
+            diag.push({ apiPath: path, found: list.length })
+            for (const p of list) {
+              results.push(norm({
+                name: p.name || p.fullName,
+                crime: p.crime || p.offence,
+                state: p.state,
+                imageUrl: p.image || p.photo ? resolve(p.image || p.photo, base) : null,
+                status: p.status || 'Wanted',
+                sourceUrl: `${base}/WantedPersons`,
+              }, 'efcc', 'EFCC', '#1976d2'))
+            }
+            break
+          }
+        } catch (e) {
+          diag.push({ apiPath: path, err: e.message })
+        }
+      }
+    }
+
+    // ── Strategy 4: legacy Joomla individual article pages ───────────────────
+    // Known individual person slugs from EFCC (gathered from news/press releases)
+    if (results.length === 0) {
+      const knownSlugs = [
+        'timipre-sylva-1',
+        'aisha-sulaiman-achimugu',
+        'yahaya-bello',
+      ]
+      for (const slug of knownSlugs) {
+        try {
+          const r = await fetchUrl(`${base}/wantedPersons/${slug}`, { timeout: 12000 })
+          if (r.status !== 200) continue
+          const h1 = r.html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
+          const name = h1 ? strip(h1[1]) : null
+          if (!name) continue
+          const imgM = r.html.match(/src="([^"]*(?:jpg|jpeg|png|webp)[^"]*)"/i)
+          const bodyM = r.html.match(/<main[^>]*>([\s\S]*?)<\/main>/i)
+          const body = bodyM ? strip(bodyM[1]).slice(0, 500) : ''
+          const crimeM = body.match(/(?:wanted for|alleged|connection with|conspiracy|fraud)[^\n.]{5,200}/i)
+          results.push(norm({
+            name: name.replace(/^wanted[:\s-]*/i,'').trim(),
+            crime: crimeM ? crimeM[0].trim() : 'Financial Crime / Fraud',
+            imageUrl: imgM ? resolve(imgM[1], base) : null,
+            description: body.slice(0, 300),
+            sourceUrl: `${base}/wantedPersons/${slug}`,
+          }, 'efcc', 'EFCC', '#1976d2'))
+        } catch (e) {
+          diag.push({ slug, err: e.message })
+        }
+      }
+    }
+  } catch (e) {
+    diag.push({ efccTopError: e.message })
   }
 
-  // Step 2: collect all (detailUrl -> name) from heading links
-  const headingRe = /<h[123][^>]*>\s*<a\s+href="(https:\/\/icpc\.gov\.ng\/[^"#?]+\/)"[^>]*>([\s\S]*?)<\/a>\s*<\/h[123]>/gi
-  const nameMap = new Map()
-  while ((m = headingRe.exec(html)) !== null) {
-    const detailUrl = m[1]
-    const name      = strip(m[2])
-    if (name && name.length > 1 && !nameMap.has(detailUrl)) nameMap.set(detailUrl, name)
+  if (results.length) cacheSet(ck, results)
+  return { results, diagnostics: diag }
+}
+
+// ─── NPF SCRAPER ──────────────────────────────────────────────────────────────
+async function scrapeNPF() {
+  const ck = 'npf'
+  const cached = cacheGet(ck)
+  if (cached) return { results: cached, source: 'cache' }
+
+  const base = 'https://npf.gov.ng'
+  const results = []
+  const diag = []
+
+  // Try the index page first for any data
+  try {
+    const { html, status } = await fetchUrl(`${base}/wanted`, { timeout: 12000, rejectUnauth: true })
+    diag.push({ url: `${base}/wanted`, status, len: html.length })
+
+    // Check for embedded JSON
+    const jsonM = html.match(/var\s+(?:wantedData|persons|wanted)\s*=\s*(\[[\s\S]*?\]);/)
+    if (jsonM) {
+      try {
+        const data = JSON.parse(jsonM[1])
+        for (const p of data) {
+          results.push(norm({
+            name: p.name || p.fullName,
+            crime: p.crime || p.offence || 'Criminal Offence',
+            state: p.state,
+            imageUrl: p.image ? resolve(p.image, base) : null,
+            status: p.status || 'Wanted',
+            sourceUrl: `${base}/wanted`,
+          }, 'npf', 'NPF', '#e8340a'))
+        }
+      } catch (_) {}
+    }
+
+    // Collect links to detail pages
+    const idSet = new Set()
+    const re = /\/wanted\/details\/(\d+)/g
+    let m
+    while ((m = re.exec(html))) idSet.add(Number(m[1]))
+
+    // Sequential probe
+    for (let i = 1; i <= 80; i++) idSet.add(i)
+
+    const ids = [...idSet].sort((a,b)=>a-b)
+    let noHitStreak = 0
+
+    for (let i = 0; i < ids.length; i += 5) {
+      const batch = ids.slice(i, i + 5)
+      const fetches = await Promise.allSettled(
+        batch.map(id => fetchUrl(`${base}/wanted/details/${id}`, { timeout: 10000, rejectUnauth: true }))
+      )
+      let batchHit = false
+      for (let j = 0; j < fetches.length; j++) {
+        const f = fetches[j]
+        if (f.status !== 'fulfilled') continue
+        const { html: dhtml, status: ds } = f.value
+        if (ds === 404 || ds === 403 || dhtml.length < 300) continue
+
+        const h = dhtml.match(/<h[123][^>]*>([\s\S]*?)<\/h[123]>/i)
+        const name = h ? strip(h[1]) : null
+        if (!name || name.length < 2 || /nigeria police|npf|home|wanted persons/i.test(name)) continue
+
+        const offM = dhtml.match(/(?:Offence|Crime|Charge)[^:]*:\s*([^\n<]{3,200})/i)
+        const stM  = dhtml.match(/(?:State|Zone|Command)[^:]*:\s*([^\n<]{2,60})/i)
+        const imgM = dhtml.match(/src="([^"]+(?:jpg|jpeg|png|webp)[^"]*)"/i)
+        const bdM  = dhtml.match(/<p[^>]*>([\s\S]*?)<\/p>/i)
+
+        batchHit = true
+        noHitStreak = 0
+        results.push(norm({
+          name,
+          crime: offM ? offM[1].trim() : 'Criminal Offence',
+          state: stM ? stM[1].trim() : null,
+          imageUrl: imgM ? resolve(imgM[1], base) : null,
+          description: bdM ? strip(bdM[1]).slice(0, 300) : null,
+          status: /apprehend|arrest|caught/i.test(dhtml) ? 'Apprehended' : 'Wanted',
+          sourceUrl: `${base}/wanted/details/${batch[j]}`,
+        }, 'npf', 'NPF', '#e8340a'))
+      }
+      if (!batchHit) noHitStreak++
+      if (noHitStreak > 3 && i > 10) break
+    }
+  } catch (e) {
+    diag.push({ npfError: e.message })
   }
 
-  // Step 3: merge — prefer name from heading, fall back to img title
-  const allUrls = new Set([...imgMap.keys(), ...nameMap.keys()])
-  for (const detailUrl of allUrls) {
-    if (seen.has(detailUrl)) continue
-    seen.add(detailUrl)
-    const img  = imgMap.get(detailUrl)
-    const name = nameMap.get(detailUrl) || (img && img.imgTitle) || 'Unknown'
-    // Skip navigation/menu links that sneak in
-    if (/wanted-persons|icpc\.gov\.ng\/$|contact|about|special|download|news|gallery|faq|petition|foi|office|proactive/i.test(detailUrl)) continue
-    if (name.length < 2) continue
-    results.push(record({
-      name,
-      crime:     'Corruption / Financial Crime',
-      imageUrl:  img ? img.imageUrl : null,
-      sourceUrl: detailUrl,
-    }, 'icpc', 'ICPC', '#d4a017'))
+  if (results.length) cacheSet(ck, results)
+  return { results, diagnostics: diag }
+}
+
+// ─── ICPC SCRAPER ─────────────────────────────────────────────────────────────
+async function scrapeICPC() {
+  const ck = 'icpc'
+  const cached = cacheGet(ck)
+  if (cached) return { results: cached, source: 'cache' }
+
+  const base = 'https://icpc.gov.ng'
+  const results = []
+  const diag = []
+  const personLinks = []
+
+  // Collect person page links from list pages
+  for (let page = 1; page <= 4; page++) {
+    const url = page === 1 ? `${base}/wanted-persons/` : `${base}/wanted-persons/page/${page}/`
+    try {
+      const { html, status } = await fetchUrl(url, { timeout: 15000 })
+      diag.push({ url, status, len: html.length })
+      if (status !== 200) break
+
+      // Links to individual person posts
+      const re = /href="(https:\/\/icpc\.gov\.ng\/(?!wanted-persons|category|tag|page|wp-content|wp-json|#)[a-z0-9-]+\/)"/gi
+      let m
+      const found = new Set()
+      while ((m = re.exec(html))) found.add(m[1])
+      diag.push({ page, links: found.size })
+      personLinks.push(...found)
+      if (found.size === 0) break
+    } catch (e) {
+      diag.push({ url, err: e.message })
+    }
   }
 
-  // Strategy B fallback: parse rendered text (markdown-like) from web_fetch
-  // Pattern pairs: [![alt](IMAGE)](DETAIL)\n# [NAME](DETAIL)
-  if (results.length === 0) {
-    const mdImgRe  = /\[!\[[^\]]*\]\((https:\/\/icpc\.gov\.ng\/wp-content\/uploads\/elementor\/thumbs\/[^)]+)\)\]\((https:\/\/icpc\.gov\.ng\/[^)]+)\)/g
-    const mdNameRe = /#\s+\[([^\]]+)\]\((https:\/\/icpc\.gov\.ng\/[^)]+)\)/g
-    const imgs = [], names = []
-    while ((m = mdImgRe.exec(html)) !== null)  imgs.push({ img: m[1], url: m[2] })
-    while ((m = mdNameRe.exec(html)) !== null)  names.push({ name: m[1], url: m[2] })
-    // Pair by matching detail URL
-    const imgByUrl = new Map(imgs.map(i => [i.url.replace(/\/$/, ''), i.img]))
-    for (const n of names) {
-      const key = n.url.replace(/\/$/, '')
-      if (seen.has(key)) continue
-      seen.add(key)
-      if (/wanted-persons|icpc\.gov\.ng\/?$|contact|about|news|download/i.test(n.url)) continue
-      results.push(record({
-        name:      strip(n.name),
-        crime:     'Corruption / Financial Crime',
-        imageUrl:  imgByUrl.get(key) || null,
-        sourceUrl: n.url,
+  // Fetch individual person pages
+  const unique = [...new Set(personLinks)]
+  for (let i = 0; i < unique.length; i += 5) {
+    const batch = unique.slice(i, i + 5)
+    const fetches = await Promise.allSettled(batch.map(u => fetchUrl(u, { timeout: 12000 })))
+    for (let j = 0; j < fetches.length; j++) {
+      const f = fetches[j]
+      if (f.status !== 'fulfilled') continue
+      const { html, status } = f.value
+      if (status !== 200) continue
+
+      const h1M = html.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i)
+             || html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
+      const name = h1M ? strip(h1M[1]) : null
+      if (!name || name.length < 2 || /icpc|wanted persons|home/i.test(name)) continue
+
+      const contentM = html.match(/<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i)
+      const fullText = contentM ? strip(contentM[1]).slice(0, 800) : ''
+
+      const crimeM = fullText.match(/(?:WANTED in connection with|declared WANTED for|alleged?|charged? with|bordering on)\s+([^.]{5,200})/i)
+        || fullText.match(/(?:corruption|fraud|brib|embezzl|launder|theft|money laundering)[^.]{0,100}/i)
+
+      const imgM = html.match(/src="(https:\/\/icpc\.gov\.ng\/wp-content\/uploads\/[^"]+(?:jpg|jpeg|png|webp))"/i)
+      const stateM = fullText.match(/(?:indigene of|from|State of)\s+([A-Z][a-z]+)\s+(?:State|LGA)/i)
+
+      results.push(norm({
+        name,
+        crime: crimeM ? strip(crimeM[0]).slice(0, 200) : 'Corruption / Financial Crime',
+        state: stateM ? stateM[1] : null,
+        description: fullText.slice(0, 400) || null,
+        imageUrl: imgM ? imgM[1] : null,
+        status: /apprehend|arrested|convicted/i.test(fullText) ? 'Apprehended' : 'Wanted',
+        sourceUrl: batch[j],
       }, 'icpc', 'ICPC', '#d4a017'))
     }
   }
 
-  return results
+  if (results.length) cacheSet(ck, results)
+  return { results, diagnostics: diag }
 }
 
-// ─── EFCC ─────────────────────────────────────────────────────────────────────
-// Real URL:  https://www.efcc.gov.ng/efcc/news-and-information/wanted-persons-1?start=N
-// Joomla paginated list, 18 items per page, ?start=0,18,36,54,72,...
-// Returns 403 on direct fetch → use allorigins proxy.
-// Each item HTML:
-//   <div class="items-row ...">
-//     <div class="item-image"><a href="DETAIL"><img src="IMAGE" alt="NAME"></a></div>
-//     <h3 class="item-title"><a href="DETAIL">NAME</a></h3>
-//   </div>
-async function scrapeEFCC() {
-  const baseUrl = 'https://www.efcc.gov.ng/efcc/news-and-information/wanted-persons-1'
-  const results = []
-  const seen = new Set()
-  const maxPages = 6 // covers up to 108 entries
-
-  for (let page = 0; page < maxPages; page++) {
-    const start = page * 18
-    const pageUrl = `${baseUrl}?start=${start}`
-    let html = ''
-
-    try {
-      // Try direct first (sometimes works depending on IP/CDN)
-      const res = await fetchUrl(pageUrl, 10000)
-      if (res.status === 403 || res.status === 503 || res.html.length < 500) throw new Error('blocked')
-      html = res.html
-    } catch {
-      try {
-        const res = await fetchViaProxy(pageUrl, 20000)
-        html = res.html
-      } catch {
-        break // Can't reach this page at all, stop
-      }
-    }
-
-    if (!html || html.length < 200) break
-
-    // Count items found on this page to detect last page
-    let foundOnPage = 0
-
-    // Pattern A — Joomla items-row structure
-    const rowRe = /<div[^>]*class="[^"]*items-row[^"]*"[^>]*>([\s\S]*?)<\/div>\s*(?=<div[^>]*class="[^"]*items-row|<div[^>]*id="[^"]*pagination|$)/gi
-    while ((m = rowRe.exec(html)) !== null) {
-      const block = m[1]
-      // Image
-      const imgM  = block.match(/<img[^>]+src="([^"]+)"[^>]*(?:alt="([^"]*)")?/i)
-      // Title/name link
-      const nameM = block.match(/<(?:h[234]|a)[^>]*class="[^"]*item-title[^"]*"[^>]*>[\s\S]*?<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
-                 || block.match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
-      if (!nameM) continue
-      const name = strip(nameM[2] || nameM[1])
-      if (!name || name.length < 2 || seen.has(name.toLowerCase())) continue
-      seen.add(name.toLowerCase())
-      const detailUrl = nameM[1].startsWith('http') ? nameM[1] : `https://www.efcc.gov.ng${nameM[1]}`
-      const rawImg = imgM ? imgM[1] : null
-      const imageUrl = rawImg ? (rawImg.startsWith('http') ? rawImg : `https://www.efcc.gov.ng${rawImg}`) : null
-      results.push(record({ name, crime: 'Financial Crime / Fraud', imageUrl, sourceUrl: detailUrl }, 'efcc', 'EFCC', '#1976d2'))
-      foundOnPage++
-    }
-
-    // Pattern B — simple article / list fallback if items-row not found
-    if (foundOnPage === 0) {
-      const articleRe = /<(?:article|li)[^>]*>([\s\S]*?)<\/(?:article|li)>/gi
-      while ((m = articleRe.exec(html)) !== null) {
-        const block = m[1]
-        const hM   = block.match(/<h[234][^>]*>([\s\S]*?)<\/h[234]>/i)
-        const imgM = block.match(/<img[^>]+src="([^"]+)"/i)
-        if (!hM) continue
-        const name = strip(hM[1])
-        if (!name || name.length < 2 || seen.has(name.toLowerCase())) continue
-        seen.add(name.toLowerCase())
-        const rawImg = imgM ? imgM[1] : null
-        const imageUrl = rawImg ? (rawImg.startsWith('http') ? rawImg : `https://www.efcc.gov.ng${rawImg}`) : null
-        results.push(record({ name, crime: 'Financial Crime / Fraud', imageUrl, sourceUrl: pageUrl }, 'efcc', 'EFCC', '#1976d2'))
-        foundOnPage++
-      }
-    }
-
-    // Pattern C — table rows
-    if (foundOnPage === 0) {
-      const trs = html.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || []
-      for (const tr of trs) {
-        const tds = (tr.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || []).map(t => strip(t))
-        if (tds.length >= 2 && tds[0].length > 2 && !/^(name|s\/n|#)/i.test(tds[0])) {
-          const name = tds[0]
-          if (seen.has(name.toLowerCase())) continue
-          seen.add(name.toLowerCase())
-          results.push(record({ name, crime: tds[1] || 'Financial Crime', state: tds[2] || null, sourceUrl: pageUrl }, 'efcc', 'EFCC', '#1976d2'))
-          foundOnPage++
-        }
-      }
-    }
-
-    // If zero records on this page, we've gone past the end
-    if (foundOnPage === 0) break
-  }
-
-  return results
-}
-
-// ─── NPF ─────────────────────────────────────────────────────────────────────
-async function scrapeNPF() {
-  const results = []
-  const seen = new Set()
-  for (const url of ['https://www.npf.gov.ng/wanted', 'https://www.npf.gov.ng/wanted?page=2']) {
-    try {
-      const { html } = await fetchUrl(url, 12000)
-      const blocks = [
-        ...(html.match(/<article[^>]*>([\s\S]*?)<\/article>/gi) || []),
-        ...(html.match(/<div[^>]*class="[^"]*(?:wanted|person|col-md-4)[^"]*"[^>]*>([\s\S]*?)<\/div>/gi) || []),
-      ]
-      for (const b of blocks) {
-        const nM = b.match(/<h[234][^>]*>([\s\S]*?)<\/h[234]>/i)
-        if (!nM) continue
-        const name = strip(nM[1])
-        if (!name || name.length < 2 || seen.has(name.toLowerCase())) continue
-        seen.add(name.toLowerCase())
-        const imgM   = b.match(/<img[^>]+src="([^"]+)"/i)
-        const crimeM = b.match(/(?:Offence|Crime|Charge)[^:]*:\s*([^\n<]{3,100})/i)
-        const stateM = b.match(/(?:State|LGA|Zone)[^:]*:\s*([^\n<]{2,60})/i)
-        const rwdM   = b.match(/Reward[^:]*:\s*(₦?[\d,]+(?:\s*[Mm]illion)?)/i)
-        const raw = imgM ? imgM[1] : null
-        results.push(record({
-          name, crime: crimeM?.[1]?.trim() || null,
-          state: stateM?.[1]?.trim() || null,
-          reward: rwdM ? `₦${rwdM[1].replace('₦','')}` : null,
-          imageUrl: raw ? (raw.startsWith('http') ? raw : `https://www.npf.gov.ng${raw}`) : null,
-          sourceUrl: url,
-        }, 'npf', 'NPF', '#e8340a'))
-      }
-      // Table fallback
-      if (results.length === 0) {
-        for (const tr of html.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || []) {
-          const tds = (tr.match(/<td[^>]*>([\s\S]*?)<\/td>/gi)||[]).map(t=>strip(t))
-          if (tds.length >= 2 && tds[0].length > 2 && !/name|sn|#/i.test(tds[0])) {
-            if (seen.has(tds[0].toLowerCase())) continue
-            seen.add(tds[0].toLowerCase())
-            results.push(record({ name:tds[0], crime:tds[1], state:tds[2], sourceUrl:url }, 'npf','NPF','#e8340a'))
-          }
-        }
-      }
-    } catch {}
-  }
-  return results
-}
-
-// ─── INTERIOR ─────────────────────────────────────────────────────────────────
-// Only publishes photos, no names. Collect all /wp-content/uploads/ images
-// that look like the WA0xxx series (correctional escapees).
+// ─── INTERIOR SCRAPER ─────────────────────────────────────────────────────────
 async function scrapeInterior() {
-  const url = 'https://interior.gov.ng/wanted-persons/'
-  const { html } = await fetchUrl(url, 12000)
+  const ck = 'interior'
+  const cached = cacheGet(ck)
+  if (cached) return { results: cached, source: 'cache' }
+
+  const base = 'https://interior.gov.ng'
   const results = []
-  const seen = new Set()
-  const re = /<img[^>]+src="(https:\/\/interior\.gov\.ng\/wp-content\/uploads\/\d{4}\/\d{2}\/[^"]+\.(?:jpg|jpeg|png))"[^>]*/gi
-  let m
-  while ((m = re.exec(html)) !== null) {
-    const img = m[1]
-    if (/150x150|220x150|300x81|270x270|logo|button|widget|cropped/i.test(img)) continue
-    if (seen.has(img)) continue
-    seen.add(img)
-    const waM = img.match(/wa(\d+)/i)
-    const num = waM ? parseInt(waM[1], 10) : seen.size
-    results.push(record({
-      name: `Correctional Escapee #${num}`,
-      crime: 'Correctional Service Escape / Absconder',
-      imageUrl: img,
-      description: 'Declared wanted by Nigerian Correctional Services (Ministry of Interior). No additional metadata published by the agency.',
-      sourceUrl: url,
-    }, 'interior', 'Interior', '#00c853'))
+  const diag = []
+
+  try {
+    const { html, status } = await fetchUrl(`${base}/wanted-persons/`, { timeout: 15000 })
+    diag.push({ status, len: html.length })
+
+    const imgRe = /src="(https:\/\/interior\.gov\.ng\/wp-content\/uploads\/[^"]+(?:jpg|jpeg|png|webp)[^"]*)"/gi
+    let m, idx = 0
+    while ((m = imgRe.exec(html))) {
+      if (/logo|icon|banner|slider|cropped|button|widget/i.test(m[1])) continue
+      idx++
+      results.push(norm({
+        name: `Escaped Prisoner #${String(idx).padStart(3,'0')} (NCS/Interior)`,
+        crime: 'Escaped Prisoner — Nigerian Correctional Service',
+        status: 'Wanted',
+        imageUrl: m[1],
+        description: 'Name and details are printed inside the wanted poster image. Contact NCS or nearest police station.',
+        sourceUrl: `${base}/wanted-persons/`,
+      }, 'interior', 'Interior', '#00c853'))
+    }
+    diag.push({ imagesFound: idx })
+  } catch (e) {
+    diag.push({ err: e.message })
   }
-  return results
+
+  if (results.length) cacheSet(ck, results)
+  return { results, diagnostics: diag }
 }
 
-// ─── SEED (only when ALL live scrapers fail) ──────────────────────────────────
+// ─── DEDUPLICATE ──────────────────────────────────────────────────────────────
+function dedup(arr) {
+  const seen = new Set()
+  return arr.filter(p => {
+    const k = (p.name || '').toLowerCase().replace(/[^a-z]/g,'').slice(0,20)
+    if (!k || seen.has(k)) return false
+    seen.add(k); return true
+  })
+}
+
+// ─── SEED DATA ────────────────────────────────────────────────────────────────
 function seed() {
+  const t = new Date().toISOString()
   return [
-    { id:'s1', name:'Terwase Agwaza', alias:'Gana', crime:'Terrorism / Mass Murder', status:'Wanted', reward:'₦20,000,000', state:'Benue', agency:'npf', agencyLabel:'NPF', agencyColor:'#e8340a', imageUrl:null, refId:'NPF-2025-4410', sourceUrl:'https://www.npf.gov.ng/wanted', scrapedAt:new Date().toISOString() },
-    { id:'s2', name:'Emmanuel Nwude', alias:'The Governor', crime:'Advance Fee Fraud (₦12.4B)', status:'Wanted', reward:'₦5,000,000', state:'Anambra', agency:'efcc', agencyLabel:'EFCC', agencyColor:'#1976d2', imageUrl:null, refId:'EFCC-2025-0091', sourceUrl:'https://www.efcc.gov.ng/efcc/news-and-information/wanted-persons-1', scrapedAt:new Date().toISOString() },
-    { id:'s3', name:'Abdulrasheed Maina', alias:null, crime:'Pension Fraud / Money Laundering', status:'Convicted', reward:null, state:'Abuja FCT', agency:'icpc', agencyLabel:'ICPC', agencyColor:'#d4a017', imageUrl:null, refId:'ICPC-2021-0078', sourceUrl:'https://icpc.gov.ng/wanted-persons/', scrapedAt:new Date().toISOString() },
-    { id:'s4', name:'Chukwudumeme Onwuamadike', alias:'Evans', crime:'Kidnapping / Armed Robbery', status:'Apprehended', reward:null, state:'Lagos', agency:'npf', agencyLabel:'NPF', agencyColor:'#e8340a', imageUrl:null, refId:'NPF-2017-0112', sourceUrl:'https://www.npf.gov.ng/wanted', scrapedAt:new Date().toISOString() },
+    { id:'e1', name:'Timipre Sylva', alias:null, crime:'Conspiracy & Dishonest Conversion of $14,859,257 (NCDMB funds)', status:'Wanted', reward:null, state:'Bayelsa', agency:'efcc', agencyLabel:'EFCC', agencyColor:'#1976d2', imageUrl:null, refId:'EFCC-2025-1101', sourceUrl:'https://www.efcc.gov.ng/WantedPersons', scrapedAt:t },
+    { id:'e2', name:'Aisha Sulaiman Achimugu', alias:null, crime:'Criminal Conspiracy and Money Laundering', status:'Wanted', reward:null, state:'Kogi', agency:'efcc', agencyLabel:'EFCC', agencyColor:'#1976d2', imageUrl:null, refId:'EFCC-2025-0847', sourceUrl:'https://www.efcc.gov.ng/WantedPersons', scrapedAt:t },
+    { id:'e3', name:'Emmanuel Nwude', alias:'The Governor', crime:'Advance Fee Fraud (₦12.4B)', status:'Wanted', reward:'₦5,000,000', state:'Anambra', agency:'efcc', agencyLabel:'EFCC', agencyColor:'#1976d2', imageUrl:null, refId:'EFCC-2025-0091', sourceUrl:'https://www.efcc.gov.ng/WantedPersons', scrapedAt:t },
+    { id:'n1', name:'Terwase Akwaza', alias:'Gana', crime:'Terrorism / Mass Murder / Kidnapping', status:'Wanted', reward:'₦20,000,000', state:'Benue', agency:'npf', agencyLabel:'NPF', agencyColor:'#e8340a', imageUrl:null, refId:'NPF-2025-4410', sourceUrl:'https://npf.gov.ng/wanted', scrapedAt:t },
+    { id:'n2', name:'Chukwudumeme Onwuamadike', alias:'Evans', crime:'Kidnapping / Armed Robbery', status:'Apprehended', reward:null, state:'Lagos', agency:'npf', agencyLabel:'NPF', agencyColor:'#e8340a', imageUrl:null, refId:'NPF-2017-0112', sourceUrl:'https://npf.gov.ng/wanted', scrapedAt:t },
+    { id:'i1', name:'Zichao Qui', alias:null, crime:'Corruption / Money Laundering — Fortunetech Ltd', status:'Wanted', reward:null, state:null, agency:'icpc', agencyLabel:'ICPC', agencyColor:'#d4a017', imageUrl:'https://icpc.gov.ng/wp-content/uploads/2026/01/zhichao-qiu.jpeg', refId:null, sourceUrl:'https://icpc.gov.ng/mr-zichao-qui/', scrapedAt:t },
+    { id:'i2', name:'Sahabo Abubakar Ahiwa', alias:null, crime:'Corruption / Related Offences', status:'Wanted', reward:null, state:null, agency:'icpc', agencyLabel:'ICPC', agencyColor:'#d4a017', imageUrl:null, refId:null, sourceUrl:'https://icpc.gov.ng/wanted-persons/', scrapedAt:t },
+    { id:'t1', name:'Escaped Prisoner #001 (NCS/Interior)', alias:null, crime:'Escaped Prisoner — Nigerian Correctional Service', status:'Wanted', reward:null, state:null, agency:'interior', agencyLabel:'Interior', agencyColor:'#00c853', imageUrl:'https://interior.gov.ng/wp-content/uploads/2025/05/img-20210520-wa0006.jpg', refId:null, sourceUrl:'https://interior.gov.ng/wanted-persons/', scrapedAt:t },
   ]
 }
 
 // ─── HANDLER ──────────────────────────────────────────────────────────────────
 exports.handler = async function(event) {
-  const agency = (event.queryStringParameters || {}).agency || 'all'
+  const p = event.queryStringParameters || {}
+  const agency  = (p.agency || 'all').toLowerCase()
+  const noCache = p.nocache === '1'
+  const diagnose = p.diagnose === '1'
+
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Content-Type': 'application/json',
-    'Cache-Control': 'public, max-age=1800',
+    'Cache-Control': 'public, max-age=1800, stale-while-revalidate=3600',
   }
-  if (event.httpMethod === 'OPTIONS') return { statusCode:204, headers, body:'' }
+
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers, body: '' }
+  if (noCache) ['efcc','npf','icpc','interior'].forEach(k => delete _cache[k])
 
   try {
-    const jobs = []
-    if (agency==='all'||agency==='efcc')     jobs.push(scrapeEFCC().catch(()=>[]))
-    if (agency==='all'||agency==='npf')      jobs.push(scrapeNPF().catch(()=>[]))
-    if (agency==='all'||agency==='icpc')     jobs.push(scrapeICPC().catch(()=>[]))
-    if (agency==='all'||agency==='interior') jobs.push(scrapeInterior().catch(()=>[]))
+    const scrapers = []
+    if (agency === 'all' || agency === 'efcc')     scrapers.push(scrapeEFCC())
+    if (agency === 'all' || agency === 'npf')      scrapers.push(scrapeNPF())
+    if (agency === 'all' || agency === 'icpc')     scrapers.push(scrapeICPC())
+    if (agency === 'all' || agency === 'interior') scrapers.push(scrapeInterior())
 
-    let persons = (await Promise.all(jobs)).flat()
+    const settled = await Promise.allSettled(scrapers)
+    const agencyStats = {}
+    let persons = []
 
-    // Deduplicate by normalised name
-    const ns = new Set()
-    persons = persons.filter(p => {
-      const k = p.name.toLowerCase().replace(/[^a-z0-9]/g,'')
-      if (ns.has(k)) return false; ns.add(k); return true
-    })
+    for (const r of settled) {
+      if (r.status === 'fulfilled') {
+        const { results, diagnostics, source } = r.value
+        persons.push(...results)
+        if (results[0]?.agency) {
+          agencyStats[results[0].agency] = { count: results.length, source: source || 'live', ...(diagnose && { diagnostics }) }
+        }
+      } else {
+        console.error('Scraper failed:', r.reason?.message)
+      }
+    }
 
-    // Sort: Wanted first
-    const pri = { Wanted:0, Escaped:1, Apprehended:2, Convicted:3 }
-    persons.sort((a,b) => (pri[a.status]||5)-(pri[b.status]||5))
+    persons = dedup(persons)
+    persons.sort((a,b) => ({ Wanted:0, Critical:0, Escaped:1, Apprehended:2, Convicted:3 }[a.status]??5) - ({ Wanted:0, Critical:0, Escaped:1, Apprehended:2, Convicted:3 }[b.status]??5))
 
     const usedSeed = persons.length === 0
     if (usedSeed) persons = seed()
 
-    return { statusCode:200, headers, body:JSON.stringify({ success:true, total:persons.length, usedSeed, scrapedAt:new Date().toISOString(), persons }) }
-  } catch(err) {
-    return { statusCode:500, headers, body:JSON.stringify({ success:false, error:err.message, persons:seed(), usedSeed:true }) }
+    return {
+      statusCode: 200, headers,
+      body: JSON.stringify({ success:true, total:persons.length, usedSeed, cacheHit:Object.values(agencyStats).some(s=>s.source==='cache'), scrapedAt:new Date().toISOString(), nextRefreshIn:CACHE_TTL, agencyStats, persons }),
+    }
+  } catch (err) {
+    return { statusCode:500, headers, body: JSON.stringify({ success:false, error:err.message, persons:seed(), usedSeed:true }) }
   }
 }
 
 // ─── VERCEL ADAPTER ───────────────────────────────────────────────────────────
-module.exports.default = async (req, res) => {
-  const result = await exports.handler({ httpMethod: req.method, queryStringParameters: req.query })
+module.exports.default = async function(req, res) {
+  const result = await exports.handler({
+    httpMethod: req.method,
+    queryStringParameters: req.query || {},
+    headers: req.headers,
+  })
   res.status(result.statusCode)
-  Object.entries(result.headers||{}).forEach(([k,v]) => res.setHeader(k,v))
+  Object.entries(result.headers || {}).forEach(([k,v]) => res.setHeader(k,v))
   res.send(result.body)
 }
