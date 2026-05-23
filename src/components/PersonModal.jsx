@@ -79,7 +79,7 @@ export default function PersonModal({ person, onClose }) {
               {person.imageUrl ? (
                 <img src={person.imageUrl ? `https://wsrv.nl/?url=${encodeURIComponent(person.imageUrl)}&w=400&h=500&fit=cover&we` : ""} alt={person.name}
                   style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
-                  onError={e => { if (e.target.src !== person.imageUrl) { e.target.src = person.imageUrl } else { e.target.style.display = "none" } }}
+                  onError={e => { if (!e.target.dataset.fb) { e.target.dataset.fb="1"; e.target.src = person.imageUrl } else { e.target.style.display = "none" } }}
                 />
               ) : (
                 <div style={{
